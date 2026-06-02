@@ -8,18 +8,27 @@ use network_manager_db::{
     DeviceMutationResult, IdentityCorrectionResult, IdentityLookup, SqliteStore, UserSettingsExport,
 };
 use network_manager_ipc::pb::{
-    GetDaemonStatusRequest, ListDeviceIdentitiesRequest, ListDiscoveredDevicesRequest,
-    RefreshRequest, ResolveSshTargetRequest,
+    DeviceMutationResponse, DeviceTagRequest, GetDaemonStatusRequest, GetDeviceDetailsRequest,
+    GetDeviceDetailsResponse, IdentityCorrectionResponse, ListDeviceIdentitiesRequest,
+    ListDiscoveredDevicesRequest, MergeIdentitiesRequest, RefreshRequest, ResolveSshTargetRequest,
+    SetDeviceCategoryRequest, SetDeviceTextRequest, SetEndpointPreferenceRequest,
+    SetOptionalStringRequest, SetSshPortRequest, SetTrackedStateRequest,
+    SplitDiscoveredDeviceRequest,
 };
 use serde::Serialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 const EXIT_NOT_FOUND: i32 = 20;
 const EXIT_AMBIGUOUS: i32 = 21;
 const EXIT_UNAVAILABLE: i32 = 22;
 const EXIT_DAEMON_DOWN: i32 = 23;
 const DEFAULT_LAUNCH_AGENT_LABEL: &str = "com.network-manager.daemon";
+
+type IpcClient = network_manager_ipc::pb::network_manager_client::NetworkManagerClient<
+    tonic::transport::Channel,
+>;
 
 #[derive(Debug, Parser)]
 #[command(name = "network-manager", about = "Agent-friendly Network Manager CLI")]
@@ -643,91 +652,109 @@ async fn run() -> Result<()> {
                 print_struct(&devices, cli.json)?;
             }
             DevicesCommand::Show(args) => {
-                let details = show_device(&paths, &args.device)?;
+                let details = show_device(&cli, &paths, &args.device).await?;
                 print_struct(&details, cli.json)?;
             }
             DevicesCommand::Track(args) => {
                 let result = mutate_tracked_state(
+                    &cli,
                     &paths,
                     &args.device,
                     TrackedState::Tracked,
                     args.label.as_deref(),
                     args.alias.as_deref(),
-                )?;
+                )
+                .await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Untrack(args) => {
                 let result = mutate_tracked_state(
+                    &cli,
                     &paths,
                     &args.device,
                     TrackedState::Untracked,
                     None,
                     None,
-                )?;
+                )
+                .await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Ignore(args) => {
-                let result =
-                    mutate_tracked_state(&paths, &args.device, TrackedState::Ignored, None, None)?;
+                let result = mutate_tracked_state(
+                    &cli,
+                    &paths,
+                    &args.device,
+                    TrackedState::Ignored,
+                    None,
+                    None,
+                )
+                .await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Label(args) => {
-                let store = open_store(&paths.db)?;
-                let identity_id = lookup_or_exit(&store, &args.device)?;
-                let result = store.set_label_by_id(&identity_id, &args.label)?;
+                let result = set_label(&cli, &paths, &args.device, &args.label).await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Alias(args) => {
-                let store = open_store(&paths.db)?;
-                let identity_id = lookup_or_exit(&store, &args.device)?;
-                let result = store.set_alias_by_id(&identity_id, &args.alias)?;
+                let result = set_alias(&cli, &paths, &args.device, &args.alias).await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Category(args) => {
-                let result =
-                    set_category(&paths, &args.device, args.category.as_deref(), args.clear)?;
+                let result = set_category(
+                    &cli,
+                    &paths,
+                    &args.device,
+                    args.category.as_deref(),
+                    args.clear,
+                )
+                .await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Tag(args) => {
-                let result = add_tag(&paths, &args.device, &args.tag)?;
+                let result = add_tag(&cli, &paths, &args.device, &args.tag).await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Untag(args) => {
-                let result = remove_tag(&paths, &args.device, &args.tag)?;
+                let result = remove_tag(&cli, &paths, &args.device, &args.tag).await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::SshUser(args) => {
-                let store = open_store(&paths.db)?;
-                let identity_id = lookup_or_exit(&store, &args.device)?;
-                let username = if args.clear {
-                    None
-                } else {
-                    args.username.as_deref()
-                };
-                let result = store.set_ssh_username_by_id(&identity_id, username)?;
+                let result = set_ssh_username(
+                    &cli,
+                    &paths,
+                    &args.device,
+                    args.username.as_deref(),
+                    args.clear,
+                )
+                .await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::SshPort(args) => {
-                let store = open_store(&paths.db)?;
-                let identity_id = lookup_or_exit(&store, &args.device)?;
-                let port = if args.clear { None } else { args.port };
-                let result = store.set_ssh_port_by_id(&identity_id, port)?;
+                let result =
+                    set_ssh_port(&cli, &paths, &args.device, args.port, args.clear).await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Preference(args) => {
-                let store = open_store(&paths.db)?;
-                let identity_id = lookup_or_exit(&store, &args.device)?;
                 let result =
-                    store.set_endpoint_preference_by_id(&identity_id, args.preference.as_core())?;
+                    set_endpoint_preference(&cli, &paths, &args.device, args.preference.as_core())
+                        .await?;
                 print_mutation(result, cli.json)?;
             }
             DevicesCommand::Merge(args) => {
-                let result =
-                    merge_identities(&paths, &args.source, &args.target, args.reason.as_deref())?;
+                let result = merge_identities(
+                    &cli,
+                    &paths,
+                    &args.source,
+                    &args.target,
+                    args.reason.as_deref(),
+                )
+                .await?;
                 print_correction(result, cli.json)?;
             }
             DevicesCommand::Split(args) => {
-                let result = split_discovered(&paths, &args.discovered_id, args.reason.as_deref())?;
+                let result =
+                    split_discovered(&cli, &paths, &args.discovered_id, args.reason.as_deref())
+                        .await?;
                 print_correction(result, cli.json)?;
             }
         },
@@ -736,60 +763,86 @@ async fn run() -> Result<()> {
             print_struct(&devices, cli.json)?;
         }
         Command::Show(args) => {
-            let details = show_device(&paths, &args.device)?;
+            let details = show_device(&cli, &paths, &args.device).await?;
             print_struct(&details, cli.json)?;
         }
         Command::Track(args) => {
             let result = mutate_tracked_state(
+                &cli,
                 &paths,
                 &args.device,
                 TrackedState::Tracked,
                 args.label.as_deref(),
                 args.alias.as_deref(),
-            )?;
+            )
+            .await?;
             print_mutation(result, cli.json)?;
         }
         Command::Untrack(args) => {
-            let result =
-                mutate_tracked_state(&paths, &args.device, TrackedState::Untracked, None, None)?;
+            let result = mutate_tracked_state(
+                &cli,
+                &paths,
+                &args.device,
+                TrackedState::Untracked,
+                None,
+                None,
+            )
+            .await?;
             print_mutation(result, cli.json)?;
         }
         Command::Ignore(args) => {
-            let result =
-                mutate_tracked_state(&paths, &args.device, TrackedState::Ignored, None, None)?;
+            let result = mutate_tracked_state(
+                &cli,
+                &paths,
+                &args.device,
+                TrackedState::Ignored,
+                None,
+                None,
+            )
+            .await?;
             print_mutation(result, cli.json)?;
         }
         Command::Label(args) => {
-            let store = open_store(&paths.db)?;
-            let identity_id = lookup_or_exit(&store, &args.device)?;
-            let result = store.set_label_by_id(&identity_id, &args.label)?;
+            let result = set_label(&cli, &paths, &args.device, &args.label).await?;
             print_mutation(result, cli.json)?;
         }
         Command::Alias(args) => {
-            let store = open_store(&paths.db)?;
-            let identity_id = lookup_or_exit(&store, &args.device)?;
-            let result = store.set_alias_by_id(&identity_id, &args.alias)?;
+            let result = set_alias(&cli, &paths, &args.device, &args.alias).await?;
             print_mutation(result, cli.json)?;
         }
         Command::Category(args) => {
-            let result = set_category(&paths, &args.device, args.category.as_deref(), args.clear)?;
+            let result = set_category(
+                &cli,
+                &paths,
+                &args.device,
+                args.category.as_deref(),
+                args.clear,
+            )
+            .await?;
             print_mutation(result, cli.json)?;
         }
         Command::Tag(args) => {
-            let result = add_tag(&paths, &args.device, &args.tag)?;
+            let result = add_tag(&cli, &paths, &args.device, &args.tag).await?;
             print_mutation(result, cli.json)?;
         }
         Command::Untag(args) => {
-            let result = remove_tag(&paths, &args.device, &args.tag)?;
+            let result = remove_tag(&cli, &paths, &args.device, &args.tag).await?;
             print_mutation(result, cli.json)?;
         }
         Command::Merge(args) => {
-            let result =
-                merge_identities(&paths, &args.source, &args.target, args.reason.as_deref())?;
+            let result = merge_identities(
+                &cli,
+                &paths,
+                &args.source,
+                &args.target,
+                args.reason.as_deref(),
+            )
+            .await?;
             print_correction(result, cli.json)?;
         }
         Command::Split(args) => {
-            let result = split_discovered(&paths, &args.discovered_id, args.reason.as_deref())?;
+            let result =
+                split_discovered(&cli, &paths, &args.discovered_id, args.reason.as_deref()).await?;
             print_correction(result, cli.json)?;
         }
         Command::Discover {
@@ -1491,7 +1544,356 @@ async fn list_discovered(cli: &Cli, paths: &Paths) -> Result<Vec<DiscoveredOutpu
         .collect())
 }
 
-fn show_device(paths: &Paths, query: &str) -> Result<DeviceDetailsOutput> {
+async fn show_device(cli: &Cli, paths: &Paths, query: &str) -> Result<DeviceDetailsOutput> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .get_device_details(GetDeviceDetailsRequest {
+                        device_query: query.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return device_details_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    show_device_from_store(paths, query)
+}
+
+async fn mutate_tracked_state(
+    cli: &Cli,
+    paths: &Paths,
+    query: &str,
+    state: TrackedState,
+    label: Option<&str>,
+    alias: Option<&str>,
+) -> Result<DeviceMutationResult> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .set_tracked_state(SetTrackedStateRequest {
+                        device_query: query.to_string(),
+                        tracked_state: state.as_str().to_string(),
+                        label: label.unwrap_or_default().to_string(),
+                        alias: alias.unwrap_or_default().to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    mutate_tracked_state_from_store(paths, query, state, label, alias)
+}
+
+async fn set_label(
+    cli: &Cli,
+    paths: &Paths,
+    query: &str,
+    label: &str,
+) -> Result<DeviceMutationResult> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .set_device_label(SetDeviceTextRequest {
+                        device_query: query.to_string(),
+                        value: label.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    set_label_from_store(paths, query, label)
+}
+
+async fn set_alias(
+    cli: &Cli,
+    paths: &Paths,
+    query: &str,
+    alias: &str,
+) -> Result<DeviceMutationResult> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .set_device_alias(SetDeviceTextRequest {
+                        device_query: query.to_string(),
+                        value: alias.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    set_alias_from_store(paths, query, alias)
+}
+
+async fn set_category(
+    cli: &Cli,
+    paths: &Paths,
+    query: &str,
+    category: Option<&str>,
+    clear: bool,
+) -> Result<DeviceMutationResult> {
+    let category = if clear {
+        None
+    } else {
+        Some(category.ok_or_else(|| anyhow!("category is required unless --clear is used"))?)
+    };
+
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .set_device_category(SetDeviceCategoryRequest {
+                        device_query: query.to_string(),
+                        category: category.unwrap_or_default().to_string(),
+                        clear,
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    set_category_from_store(paths, query, category, clear)
+}
+
+async fn add_tag(cli: &Cli, paths: &Paths, query: &str, tag: &str) -> Result<DeviceMutationResult> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .add_device_tag(DeviceTagRequest {
+                        device_query: query.to_string(),
+                        tag: tag.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    add_tag_from_store(paths, query, tag)
+}
+
+async fn remove_tag(
+    cli: &Cli,
+    paths: &Paths,
+    query: &str,
+    tag: &str,
+) -> Result<DeviceMutationResult> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .remove_device_tag(DeviceTagRequest {
+                        device_query: query.to_string(),
+                        tag: tag.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    remove_tag_from_store(paths, query, tag)
+}
+
+async fn set_ssh_username(
+    cli: &Cli,
+    paths: &Paths,
+    query: &str,
+    username: Option<&str>,
+    clear: bool,
+) -> Result<DeviceMutationResult> {
+    if !clear && username.is_none() {
+        return Err(anyhow!("SSH username is required unless --clear is used"));
+    }
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .set_ssh_username(SetOptionalStringRequest {
+                        device_query: query.to_string(),
+                        value: username.unwrap_or_default().to_string(),
+                        clear,
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    set_ssh_username_from_store(paths, query, username, clear)
+}
+
+async fn set_ssh_port(
+    cli: &Cli,
+    paths: &Paths,
+    query: &str,
+    port: Option<u16>,
+    clear: bool,
+) -> Result<DeviceMutationResult> {
+    if !clear && port.is_none() {
+        return Err(anyhow!("SSH port is required unless --clear is used"));
+    }
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .set_ssh_port(SetSshPortRequest {
+                        device_query: query.to_string(),
+                        port: port.unwrap_or_default() as u32,
+                        clear,
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    set_ssh_port_from_store(paths, query, port, clear)
+}
+
+async fn set_endpoint_preference(
+    cli: &Cli,
+    paths: &Paths,
+    query: &str,
+    preference: EndpointPreference,
+) -> Result<DeviceMutationResult> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .set_endpoint_preference(SetEndpointPreferenceRequest {
+                        device_query: query.to_string(),
+                        endpoint_preference: preference.as_str().to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return mutation_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    set_endpoint_preference_from_store(paths, query, preference)
+}
+
+async fn merge_identities(
+    cli: &Cli,
+    paths: &Paths,
+    source_query: &str,
+    target_query: &str,
+    reason: Option<&str>,
+) -> Result<IdentityCorrectionResult> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .merge_identities(MergeIdentitiesRequest {
+                        source_query: source_query.to_string(),
+                        target_query: target_query.to_string(),
+                        reason: reason.unwrap_or_default().to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return correction_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    merge_identities_from_store(paths, source_query, target_query, reason)
+}
+
+async fn split_discovered(
+    cli: &Cli,
+    paths: &Paths,
+    discovered_id: &str,
+    reason: Option<&str>,
+) -> Result<IdentityCorrectionResult> {
+    if !cli.offline {
+        match network_manager_ipc::connect_uds(&paths.socket).await {
+            Ok(mut client) => {
+                let response = client
+                    .split_discovered_device(SplitDiscoveredDeviceRequest {
+                        discovered_device_id: discovered_id.to_string(),
+                        reason: reason.unwrap_or_default().to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                return correction_from_response(response);
+            }
+            Err(error) if cli.require_daemon => {
+                eprintln!("daemon unavailable: {error:#}");
+                std::process::exit(EXIT_DAEMON_DOWN);
+            }
+            Err(_) => {}
+        }
+    }
+    split_discovered_from_store(paths, discovered_id, reason)
+}
+
+fn show_device_from_store(paths: &Paths, query: &str) -> Result<DeviceDetailsOutput> {
     let store = open_store(&paths.db)?;
     let identity_id = lookup_or_exit(&store, query)?;
     let Some(details) = store.device_details_by_id(&identity_id)? else {
@@ -1520,7 +1922,7 @@ fn show_device(paths: &Paths, query: &str) -> Result<DeviceDetailsOutput> {
     })
 }
 
-fn mutate_tracked_state(
+fn mutate_tracked_state_from_store(
     paths: &Paths,
     query: &str,
     state: TrackedState,
@@ -1532,7 +1934,19 @@ fn mutate_tracked_state(
     store.set_tracked_state_by_id(&identity_id, state, label, alias)
 }
 
-fn set_category(
+fn set_label_from_store(paths: &Paths, query: &str, label: &str) -> Result<DeviceMutationResult> {
+    let store = open_store(&paths.db)?;
+    let identity_id = lookup_or_exit(&store, query)?;
+    store.set_label_by_id(&identity_id, label)
+}
+
+fn set_alias_from_store(paths: &Paths, query: &str, alias: &str) -> Result<DeviceMutationResult> {
+    let store = open_store(&paths.db)?;
+    let identity_id = lookup_or_exit(&store, query)?;
+    store.set_alias_by_id(&identity_id, alias)
+}
+
+fn set_category_from_store(
     paths: &Paths,
     query: &str,
     category: Option<&str>,
@@ -1548,19 +1962,53 @@ fn set_category(
     store.set_category_by_id(&identity_id, category)
 }
 
-fn add_tag(paths: &Paths, query: &str, tag: &str) -> Result<DeviceMutationResult> {
+fn add_tag_from_store(paths: &Paths, query: &str, tag: &str) -> Result<DeviceMutationResult> {
     let store = open_store(&paths.db)?;
     let identity_id = lookup_or_exit(&store, query)?;
     store.add_tag_by_id(&identity_id, tag)
 }
 
-fn remove_tag(paths: &Paths, query: &str, tag: &str) -> Result<DeviceMutationResult> {
+fn remove_tag_from_store(paths: &Paths, query: &str, tag: &str) -> Result<DeviceMutationResult> {
     let store = open_store(&paths.db)?;
     let identity_id = lookup_or_exit(&store, query)?;
     store.remove_tag_by_id(&identity_id, tag)
 }
 
-fn merge_identities(
+fn set_ssh_username_from_store(
+    paths: &Paths,
+    query: &str,
+    username: Option<&str>,
+    clear: bool,
+) -> Result<DeviceMutationResult> {
+    let store = open_store(&paths.db)?;
+    let identity_id = lookup_or_exit(&store, query)?;
+    let username = if clear { None } else { username };
+    store.set_ssh_username_by_id(&identity_id, username)
+}
+
+fn set_ssh_port_from_store(
+    paths: &Paths,
+    query: &str,
+    port: Option<u16>,
+    clear: bool,
+) -> Result<DeviceMutationResult> {
+    let store = open_store(&paths.db)?;
+    let identity_id = lookup_or_exit(&store, query)?;
+    let port = if clear { None } else { port };
+    store.set_ssh_port_by_id(&identity_id, port)
+}
+
+fn set_endpoint_preference_from_store(
+    paths: &Paths,
+    query: &str,
+    preference: EndpointPreference,
+) -> Result<DeviceMutationResult> {
+    let store = open_store(&paths.db)?;
+    let identity_id = lookup_or_exit(&store, query)?;
+    store.set_endpoint_preference_by_id(&identity_id, preference)
+}
+
+fn merge_identities_from_store(
     paths: &Paths,
     source_query: &str,
     target_query: &str,
@@ -1572,7 +2020,7 @@ fn merge_identities(
     store.merge_identities_by_id(&source_id, &target_id, reason)
 }
 
-fn split_discovered(
+fn split_discovered_from_store(
     paths: &Paths,
     discovered_id: &str,
     reason: Option<&str>,
@@ -1592,6 +2040,119 @@ fn lookup_or_exit(store: &SqliteStore, query: &str) -> Result<String> {
             eprintln!("device query '{query}' is ambiguous: {}", ids.join(", "));
             std::process::exit(EXIT_AMBIGUOUS);
         }
+    }
+}
+
+fn device_details_from_response(response: GetDeviceDetailsResponse) -> Result<DeviceDetailsOutput> {
+    if response.ambiguous {
+        eprintln!(
+            "{}: {}",
+            response.message,
+            response.candidate_identity_ids.join(", ")
+        );
+        std::process::exit(EXIT_AMBIGUOUS);
+    }
+    if !response.found {
+        eprintln!("{}", response.message);
+        std::process::exit(EXIT_NOT_FOUND);
+    }
+    let device = response
+        .device
+        .context("daemon returned a found details response without a device")?;
+    Ok(DeviceDetailsOutput {
+        device: device_output_from_ipc(device),
+        endpoints: response
+            .endpoints
+            .into_iter()
+            .map(endpoint_output_from_ipc)
+            .collect(),
+    })
+}
+
+fn mutation_from_response(response: DeviceMutationResponse) -> Result<DeviceMutationResult> {
+    if response.ambiguous {
+        eprintln!(
+            "{}: {}",
+            response.message,
+            response.candidate_identity_ids.join(", ")
+        );
+        std::process::exit(EXIT_AMBIGUOUS);
+    }
+    if !response.found {
+        eprintln!("{}", response.message);
+        std::process::exit(EXIT_NOT_FOUND);
+    }
+    let device = response
+        .device
+        .context("daemon returned a mutation response without a device")?;
+    let endpoint_count = device.endpoint_count as usize;
+    Ok(DeviceMutationResult {
+        identity: identity_from_ipc(device),
+        endpoint_count,
+        message: response.message,
+    })
+}
+
+fn correction_from_response(
+    response: IdentityCorrectionResponse,
+) -> Result<IdentityCorrectionResult> {
+    if response.ambiguous {
+        eprintln!(
+            "{}: {}",
+            response.message,
+            response.candidate_identity_ids.join(", ")
+        );
+        std::process::exit(EXIT_AMBIGUOUS);
+    }
+    if !response.applied {
+        eprintln!("{}", response.message);
+        std::process::exit(EXIT_NOT_FOUND);
+    }
+    Ok(IdentityCorrectionResult {
+        identity_id: response.identity_id,
+        affected_identity_id: response.affected_identity_id,
+        message: response.message,
+    })
+}
+
+fn identity_from_ipc(
+    identity: network_manager_ipc::pb::DeviceIdentity,
+) -> network_manager_core::DeviceIdentity {
+    network_manager_core::DeviceIdentity {
+        id: identity.id,
+        stable_key: identity.stable_key,
+        label: empty_to_none(identity.label),
+        alias: empty_to_none(identity.alias),
+        tracked_state: TrackedState::from_str(&identity.tracked_state)
+            .unwrap_or(TrackedState::Untracked),
+        category: empty_to_none(identity.category),
+        tags: identity.tags,
+        ssh_username: empty_to_none(identity.ssh_username),
+        ssh_port: u16::try_from(identity.ssh_port)
+            .ok()
+            .filter(|port| *port != 0),
+        endpoint_preference: EndpointPreference::from_str(&identity.endpoint_preference)
+            .unwrap_or(EndpointPreference::Auto),
+        last_seen_at: empty_to_none(identity.last_seen_at),
+    }
+}
+
+fn device_output_from_ipc(identity: network_manager_ipc::pb::DeviceIdentity) -> DeviceOutput {
+    let endpoint_count = identity.endpoint_count as usize;
+    device_output_from_identity(identity_from_ipc(identity), endpoint_count)
+}
+
+fn endpoint_output_from_ipc(endpoint: network_manager_ipc::pb::NetworkEndpoint) -> EndpointOutput {
+    EndpointOutput {
+        id: endpoint.id,
+        kind: endpoint.kind,
+        address: endpoint.address,
+        port: u16::try_from(endpoint.port).ok().filter(|port| *port != 0),
+        hostname: empty_to_none(endpoint.hostname),
+        reachability: endpoint.reachability,
+        ssh_capability: endpoint.ssh_capability,
+        last_seen_at: empty_to_none(endpoint.last_seen_at),
+        last_checked_at: empty_to_none(endpoint.last_checked_at),
     }
 }
 
@@ -1783,14 +2344,7 @@ fn resolve_output_from_target(
     }
 }
 
-async fn connect_required(
-    cli: &Cli,
-    paths: &Paths,
-) -> Result<
-    network_manager_ipc::pb::network_manager_client::NetworkManagerClient<
-        tonic::transport::Channel,
-    >,
-> {
+async fn connect_required(cli: &Cli, paths: &Paths) -> Result<IpcClient> {
     if cli.offline {
         std::process::exit(EXIT_DAEMON_DOWN);
     }
