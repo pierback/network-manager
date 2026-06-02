@@ -1,5 +1,5 @@
 use gpui::{px, size, App, AppContext, Application, Bounds, WindowBounds, WindowOptions};
-use network_manager_ui::NetworkManagerApp;
+use network_manager_ui::{data::SqliteRepository, NetworkManagerApp};
 
 fn main() {
     Application::new().run(|cx: &mut App| {
@@ -10,7 +10,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| NetworkManagerApp::mock()),
+            |_, cx| cx.new(|_| NetworkManagerApp::new(SqliteRepository::default())),
         )
         .expect("open Network Manager desktop window");
         cx.activate(true);

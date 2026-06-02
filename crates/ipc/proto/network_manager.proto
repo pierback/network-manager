@@ -7,6 +7,18 @@ service NetworkManager {
   rpc Refresh(RefreshRequest) returns (RefreshResponse);
   rpc ListDeviceIdentities(ListDeviceIdentitiesRequest) returns (ListDeviceIdentitiesResponse);
   rpc ListDiscoveredDevices(ListDiscoveredDevicesRequest) returns (ListDiscoveredDevicesResponse);
+  rpc GetDeviceDetails(GetDeviceDetailsRequest) returns (GetDeviceDetailsResponse);
+  rpc SetTrackedState(SetTrackedStateRequest) returns (DeviceMutationResponse);
+  rpc SetDeviceLabel(SetDeviceTextRequest) returns (DeviceMutationResponse);
+  rpc SetDeviceAlias(SetDeviceTextRequest) returns (DeviceMutationResponse);
+  rpc SetDeviceCategory(SetDeviceCategoryRequest) returns (DeviceMutationResponse);
+  rpc AddDeviceTag(DeviceTagRequest) returns (DeviceMutationResponse);
+  rpc RemoveDeviceTag(DeviceTagRequest) returns (DeviceMutationResponse);
+  rpc SetSshUsername(SetOptionalStringRequest) returns (DeviceMutationResponse);
+  rpc SetSshPort(SetSshPortRequest) returns (DeviceMutationResponse);
+  rpc SetEndpointPreference(SetEndpointPreferenceRequest) returns (DeviceMutationResponse);
+  rpc MergeIdentities(MergeIdentitiesRequest) returns (IdentityCorrectionResponse);
+  rpc SplitDiscoveredDevice(SplitDiscoveredDeviceRequest) returns (IdentityCorrectionResponse);
   rpc ResolveSshTarget(ResolveSshTargetRequest) returns (ResolveSshTargetResponse);
 }
 
@@ -69,6 +81,100 @@ message DiscoveredDevice {
 
 message ListDiscoveredDevicesResponse {
   repeated DiscoveredDevice devices = 1;
+}
+
+message NetworkEndpoint {
+  string id = 1;
+  string identity_id = 2;
+  string kind = 3;
+  string address = 4;
+  uint32 port = 5;
+  string hostname = 6;
+  string reachability = 7;
+  string ssh_capability = 8;
+  string last_seen_at = 9;
+  string last_checked_at = 10;
+}
+
+message GetDeviceDetailsRequest {
+  string device_query = 1;
+}
+
+message GetDeviceDetailsResponse {
+  bool found = 1;
+  bool ambiguous = 2;
+  repeated string candidate_identity_ids = 3;
+  DeviceIdentity device = 4;
+  repeated NetworkEndpoint endpoints = 5;
+  string message = 6;
+}
+
+message SetTrackedStateRequest {
+  string device_query = 1;
+  string tracked_state = 2;
+  string label = 3;
+  string alias = 4;
+}
+
+message SetDeviceTextRequest {
+  string device_query = 1;
+  string value = 2;
+}
+
+message SetDeviceCategoryRequest {
+  string device_query = 1;
+  string category = 2;
+  bool clear = 3;
+}
+
+message DeviceTagRequest {
+  string device_query = 1;
+  string tag = 2;
+}
+
+message SetOptionalStringRequest {
+  string device_query = 1;
+  string value = 2;
+  bool clear = 3;
+}
+
+message SetSshPortRequest {
+  string device_query = 1;
+  uint32 port = 2;
+  bool clear = 3;
+}
+
+message SetEndpointPreferenceRequest {
+  string device_query = 1;
+  string endpoint_preference = 2;
+}
+
+message DeviceMutationResponse {
+  bool found = 1;
+  bool ambiguous = 2;
+  repeated string candidate_identity_ids = 3;
+  DeviceIdentity device = 4;
+  string message = 5;
+}
+
+message MergeIdentitiesRequest {
+  string source_query = 1;
+  string target_query = 2;
+  string reason = 3;
+}
+
+message SplitDiscoveredDeviceRequest {
+  string discovered_device_id = 1;
+  string reason = 2;
+}
+
+message IdentityCorrectionResponse {
+  bool applied = 1;
+  bool ambiguous = 2;
+  repeated string candidate_identity_ids = 3;
+  string identity_id = 4;
+  string affected_identity_id = 5;
+  string message = 6;
 }
 
 message ResolveSshTargetRequest {

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use network_manager_core::{
-    resolve_ssh_target, AvailabilityState, EndpointPreference, NetworkEndpoint,
+    resolve_ssh_target, AvailabilityState, DeviceIdentity as CoreDeviceIdentity,
+    EndpointPreference, NetworkEndpoint, TrackedState,
 };
 use network_manager_db::{
     IdentityLookup, LanDeviceObservation, MdnsServiceObservation, SqliteStore,
@@ -9,10 +10,14 @@ use network_manager_db::{
 };
 use network_manager_ipc::pb::network_manager_server::{NetworkManager, NetworkManagerServer};
 use network_manager_ipc::pb::{
-    DaemonStatusResponse, DeviceIdentity, DiscoveredDevice, GetDaemonStatusRequest,
-    ListDeviceIdentitiesRequest, ListDeviceIdentitiesResponse, ListDiscoveredDevicesRequest,
-    ListDiscoveredDevicesResponse, RefreshRequest, RefreshResponse, ResolveSshTargetRequest,
-    ResolveSshTargetResponse,
+    DaemonStatusResponse, DeviceIdentity, DeviceMutationResponse, DeviceTagRequest,
+    DiscoveredDevice, GetDaemonStatusRequest, GetDeviceDetailsRequest, GetDeviceDetailsResponse,
+    IdentityCorrectionResponse, ListDeviceIdentitiesRequest, ListDeviceIdentitiesResponse,
+    ListDiscoveredDevicesRequest, ListDiscoveredDevicesResponse, MergeIdentitiesRequest,
+    NetworkEndpoint as IpcNetworkEndpoint, RefreshRequest, RefreshResponse,
+    ResolveSshTargetRequest, ResolveSshTargetResponse, SetDeviceCategoryRequest,
+    SetDeviceTextRequest, SetEndpointPreferenceRequest, SetOptionalStringRequest,
+    SetSshPortRequest, SetTrackedStateRequest, SplitDiscoveredDeviceRequest,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -249,6 +254,194 @@ impl NetworkManager for DaemonService {
         }))
     }
 
+    async fn get_device_details(
+        &self,
+        request: Request<GetDeviceDetailsRequest>,
+    ) -> std::result::Result<Response<GetDeviceDetailsResponse>, Status> {
+        let query = request.into_inner().device_query;
+        let store = self.store.lock().map_err(lock_error)?;
+        let identity_id = match lookup_identity_for_rpc(&store, &query)? {
+            Ok(identity_id) => identity_id,
+            Err(failure) => return Ok(Response::new(details_lookup_failure(failure))),
+        };
+        let Some(details) = store
+            .device_details_by_id(&identity_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(Response::new(GetDeviceDetailsResponse {
+                found: false,
+                ambiguous: false,
+                candidate_identity_ids: vec![identity_id],
+                device: None,
+                endpoints: Vec::new(),
+                message: "device identity disappeared".to_string(),
+            }));
+        };
+
+        let endpoint_count = details.endpoints.len();
+        Ok(Response::new(GetDeviceDetailsResponse {
+            found: true,
+            ambiguous: false,
+            candidate_identity_ids: vec![details.identity.id.clone()],
+            device: Some(device_identity_to_ipc(details.identity, endpoint_count)),
+            endpoints: details.endpoints.into_iter().map(endpoint_to_ipc).collect(),
+            message: "found".to_string(),
+        }))
+    }
+
+    async fn set_tracked_state(
+        &self,
+        request: Request<SetTrackedStateRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        let state = TrackedState::from_str(&request.tracked_state)
+            .map_err(|error| Status::invalid_argument(format!("invalid tracked_state: {error}")))?;
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.set_tracked_state_by_id(
+                identity_id,
+                state,
+                empty_to_none_str(&request.label),
+                empty_to_none_str(&request.alias),
+            )
+        })
+    }
+
+    async fn set_device_label(
+        &self,
+        request: Request<SetDeviceTextRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.set_label_by_id(identity_id, &request.value)
+        })
+    }
+
+    async fn set_device_alias(
+        &self,
+        request: Request<SetDeviceTextRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.set_alias_by_id(identity_id, &request.value)
+        })
+    }
+
+    async fn set_device_category(
+        &self,
+        request: Request<SetDeviceCategoryRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        let category = if request.clear {
+            None
+        } else {
+            Some(request.category.as_str())
+        };
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.set_category_by_id(identity_id, category)
+        })
+    }
+
+    async fn add_device_tag(
+        &self,
+        request: Request<DeviceTagRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.add_tag_by_id(identity_id, &request.tag)
+        })
+    }
+
+    async fn remove_device_tag(
+        &self,
+        request: Request<DeviceTagRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.remove_tag_by_id(identity_id, &request.tag)
+        })
+    }
+
+    async fn set_ssh_username(
+        &self,
+        request: Request<SetOptionalStringRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        let username = if request.clear {
+            None
+        } else {
+            Some(request.value.as_str())
+        };
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.set_ssh_username_by_id(identity_id, username)
+        })
+    }
+
+    async fn set_ssh_port(
+        &self,
+        request: Request<SetSshPortRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        let port = if request.clear {
+            None
+        } else if request.port == 0 || request.port > u16::MAX as u32 {
+            return Err(Status::invalid_argument("invalid SSH port"));
+        } else {
+            Some(request.port as u16)
+        };
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.set_ssh_port_by_id(identity_id, port)
+        })
+    }
+
+    async fn set_endpoint_preference(
+        &self,
+        request: Request<SetEndpointPreferenceRequest>,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status> {
+        let request = request.into_inner();
+        let preference =
+            EndpointPreference::from_str(&request.endpoint_preference).map_err(|error| {
+                Status::invalid_argument(format!("invalid endpoint_preference: {error}"))
+            })?;
+        self.mutate_device(&request.device_query, |store, identity_id| {
+            store.set_endpoint_preference_by_id(identity_id, preference)
+        })
+    }
+
+    async fn merge_identities(
+        &self,
+        request: Request<MergeIdentitiesRequest>,
+    ) -> std::result::Result<Response<IdentityCorrectionResponse>, Status> {
+        let request = request.into_inner();
+        let store = self.store.lock().map_err(lock_error)?;
+        let source_id = match lookup_identity_for_rpc(&store, &request.source_query)? {
+            Ok(identity_id) => identity_id,
+            Err(failure) => return Ok(Response::new(correction_lookup_failure(failure))),
+        };
+        let target_id = match lookup_identity_for_rpc(&store, &request.target_query)? {
+            Ok(identity_id) => identity_id,
+            Err(failure) => return Ok(Response::new(correction_lookup_failure(failure))),
+        };
+        let result = store
+            .merge_identities_by_id(&source_id, &target_id, empty_to_none_str(&request.reason))
+            .map_err(internal_error)?;
+        Ok(Response::new(correction_success(result)))
+    }
+
+    async fn split_discovered_device(
+        &self,
+        request: Request<SplitDiscoveredDeviceRequest>,
+    ) -> std::result::Result<Response<IdentityCorrectionResponse>, Status> {
+        let request = request.into_inner();
+        let store = self.store.lock().map_err(lock_error)?;
+        let result = store
+            .split_discovered_device_by_id(
+                &request.discovered_device_id,
+                empty_to_none_str(&request.reason),
+            )
+            .map_err(internal_error)?;
+        Ok(Response::new(correction_success(result)))
+    }
+
     async fn resolve_ssh_target(
         &self,
         request: Request<ResolveSshTargetRequest>,
@@ -323,6 +516,149 @@ impl NetworkManager for DaemonService {
             message: "resolved".to_string(),
         }))
     }
+}
+
+impl DaemonService {
+    #[allow(clippy::result_large_err)]
+    fn mutate_device<F>(
+        &self,
+        query: &str,
+        mutate: F,
+    ) -> std::result::Result<Response<DeviceMutationResponse>, Status>
+    where
+        F: FnOnce(&SqliteStore, &str) -> Result<network_manager_db::DeviceMutationResult>,
+    {
+        let store = self.store.lock().map_err(lock_error)?;
+        let identity_id = match lookup_identity_for_rpc(&store, query)? {
+            Ok(identity_id) => identity_id,
+            Err(failure) => return Ok(Response::new(mutation_lookup_failure(failure))),
+        };
+        let result = mutate(&store, &identity_id).map_err(internal_error)?;
+        Ok(Response::new(mutation_success(result)))
+    }
+}
+
+#[derive(Debug)]
+struct LookupFailure {
+    ambiguous: bool,
+    candidate_identity_ids: Vec<String>,
+    message: String,
+}
+
+#[allow(clippy::result_large_err)]
+fn lookup_identity_for_rpc(
+    store: &SqliteStore,
+    query: &str,
+) -> std::result::Result<std::result::Result<String, LookupFailure>, Status> {
+    Ok(
+        match store.find_identity_id(query).map_err(internal_error)? {
+            IdentityLookup::Found(identity_id) => Ok(identity_id),
+            IdentityLookup::NotFound => Err(LookupFailure {
+                ambiguous: false,
+                candidate_identity_ids: Vec::new(),
+                message: format!("device '{query}' was not found"),
+            }),
+            IdentityLookup::Ambiguous(ids) => Err(LookupFailure {
+                ambiguous: true,
+                candidate_identity_ids: ids,
+                message: format!("device query '{query}' is ambiguous"),
+            }),
+        },
+    )
+}
+
+fn details_lookup_failure(failure: LookupFailure) -> GetDeviceDetailsResponse {
+    GetDeviceDetailsResponse {
+        found: false,
+        ambiguous: failure.ambiguous,
+        candidate_identity_ids: failure.candidate_identity_ids,
+        device: None,
+        endpoints: Vec::new(),
+        message: failure.message,
+    }
+}
+
+fn mutation_lookup_failure(failure: LookupFailure) -> DeviceMutationResponse {
+    DeviceMutationResponse {
+        found: false,
+        ambiguous: failure.ambiguous,
+        candidate_identity_ids: failure.candidate_identity_ids,
+        device: None,
+        message: failure.message,
+    }
+}
+
+fn correction_lookup_failure(failure: LookupFailure) -> IdentityCorrectionResponse {
+    IdentityCorrectionResponse {
+        applied: false,
+        ambiguous: failure.ambiguous,
+        candidate_identity_ids: failure.candidate_identity_ids,
+        identity_id: String::new(),
+        affected_identity_id: String::new(),
+        message: failure.message,
+    }
+}
+
+fn mutation_success(result: network_manager_db::DeviceMutationResult) -> DeviceMutationResponse {
+    DeviceMutationResponse {
+        found: true,
+        ambiguous: false,
+        candidate_identity_ids: vec![result.identity.id.clone()],
+        device: Some(device_identity_to_ipc(
+            result.identity,
+            result.endpoint_count,
+        )),
+        message: result.message,
+    }
+}
+
+fn correction_success(
+    result: network_manager_db::IdentityCorrectionResult,
+) -> IdentityCorrectionResponse {
+    IdentityCorrectionResponse {
+        applied: true,
+        ambiguous: false,
+        candidate_identity_ids: Vec::new(),
+        identity_id: result.identity_id,
+        affected_identity_id: result.affected_identity_id,
+        message: result.message,
+    }
+}
+
+fn device_identity_to_ipc(identity: CoreDeviceIdentity, endpoint_count: usize) -> DeviceIdentity {
+    DeviceIdentity {
+        id: identity.id,
+        stable_key: identity.stable_key,
+        label: identity.label.unwrap_or_default(),
+        alias: identity.alias.unwrap_or_default(),
+        tracked_state: identity.tracked_state.as_str().to_string(),
+        category: identity.category.unwrap_or_default(),
+        tags: identity.tags,
+        ssh_username: identity.ssh_username.unwrap_or_default(),
+        ssh_port: identity.ssh_port.unwrap_or_default() as u32,
+        endpoint_preference: identity.endpoint_preference.as_str().to_string(),
+        last_seen_at: identity.last_seen_at.unwrap_or_default(),
+        endpoint_count: endpoint_count as u32,
+    }
+}
+
+fn endpoint_to_ipc(endpoint: NetworkEndpoint) -> IpcNetworkEndpoint {
+    IpcNetworkEndpoint {
+        id: endpoint.id,
+        identity_id: endpoint.identity_id,
+        kind: endpoint.kind.as_str().to_string(),
+        address: endpoint.address,
+        port: endpoint.port.unwrap_or_default() as u32,
+        hostname: endpoint.hostname.unwrap_or_default(),
+        reachability: endpoint.reachability.as_str().to_string(),
+        ssh_capability: endpoint.ssh_capability.as_str().to_string(),
+        last_seen_at: endpoint.last_seen_at.unwrap_or_default(),
+        last_checked_at: endpoint.last_checked_at.unwrap_or_default(),
+    }
+}
+
+fn empty_to_none_str(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 #[derive(Debug)]

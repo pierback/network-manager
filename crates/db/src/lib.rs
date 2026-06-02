@@ -746,14 +746,14 @@ impl SqliteStore {
                 self.conn.execute(
                     "INSERT INTO identity_evidence(identity_id, discovered_device_id, evidence_type, evidence_value, confidence, source)
                      VALUES (?1, ?2, 'hostname', ?3, 0.65, 'mdns')",
-                    params![identity_id, discovered_id, hostname],
+                    params![identity_id, discovered_id, hostname.as_str()],
                 )?;
                 self.upsert_endpoint(
                     &identity_id,
                     "mdns",
-                    hostname,
+                    &hostname,
                     observation.port,
-                    Some(hostname),
+                    Some(&hostname),
                     "mdns",
                     "online",
                 )?;
@@ -2013,7 +2013,7 @@ fn collect_endpoint_keys_from_evidence(
             let observation: MdnsServiceObservation =
                 serde_json::from_str(evidence_json).context("parsing mDNS split evidence")?;
             if let Some(hostname) = observation.hostname {
-                let hostname = hostname.trim_end_matches('.').to_string();
+                let hostname = normalize_hostname(&hostname);
                 addresses.push(hostname.clone());
                 hostnames.push(hostname);
             }
@@ -2360,6 +2360,46 @@ mod tests {
             IdentityLookup::Found(target)
         );
         assert_eq!(store.list_device_identities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn exports_and_imports_merge_corrections() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("source.sqlite");
+        let source_store = SqliteStore::open(&source_path).unwrap();
+        source_store.migrate().unwrap();
+        let source_id = source_store
+            .insert_test_identity("manual:merge-source", Some("merge-source"))
+            .unwrap();
+        let target_id = source_store
+            .insert_test_identity("manual:merge-target", Some("merge-target"))
+            .unwrap();
+        source_store
+            .merge_identities_by_id(&source_id, &target_id, Some("portable merge"))
+            .unwrap();
+        let export = source_store.export_user_settings().unwrap();
+        assert_eq!(export.merges.len(), 1);
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.sqlite");
+        let target_store = SqliteStore::open(&target_path).unwrap();
+        target_store.migrate().unwrap();
+        target_store
+            .insert_test_identity("manual:merge-source", Some("source"))
+            .unwrap();
+        let imported_target_id = target_store
+            .insert_test_identity("manual:merge-target", Some("target"))
+            .unwrap();
+
+        let result = target_store.import_user_settings(&export, false).unwrap();
+        assert_eq!(result.merges_applied, 1);
+        assert_eq!(target_store.list_device_identities().unwrap().len(), 1);
+        assert_eq!(
+            target_store
+                .find_identity_id("manual:merge-source")
+                .unwrap(),
+            IdentityLookup::Found(imported_target_id)
+        );
     }
 
     #[test]

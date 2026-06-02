@@ -96,6 +96,14 @@ _Avoid_: Entire network, all possible devices
 The mechanism or network surface through which a device or endpoint was observed.
 _Avoid_: Device identity, endpoint type
 
+**mDNS SSH Service**:
+A Bonjour-advertised `_ssh._tcp` service observed on the local network.
+_Avoid_: Device identity, guaranteed SSH availability
+
+**Portable User Settings**:
+The exportable user-owned layer: labels, aliases, tracked state, categories, tags, SSH settings, endpoint preferences, and identity corrections.
+_Avoid_: Discovery cache, scan results
+
 **Network Interface**:
 A local network path through which devices or endpoints can be observed.
 _Avoid_: Device identity, endpoint
@@ -135,6 +143,8 @@ _Avoid_: Rename, label
 - A **Device Identity** may have **Tailscale Presence**.
 - **Tailscale Presence**, **Endpoint Reachability**, and **SSH Capability** each have an **Availability State**.
 - **Last Seen** can apply to a **Device Identity** or **Network Endpoint**.
+- **Portable User Settings** apply to matching discovered identities; importing them must not create manual devices that were never discovered.
+- The user daemon exposes typed local IPC for reads, SSH resolution, refresh requests, and user-intent mutations.
 
 ## Example dialogue
 
@@ -163,3 +173,5 @@ _Avoid_: Rename, label
 - **Device Tags** are for user organization only; they are not identity evidence.
 - IP addresses are **Network Endpoints**, not **Device Identities**; LAN IP alone must not identify a device.
 - Hostnames are **Identity Evidence**, but not absolute proof of identity.
+- Bonjour/mDNS `_ssh._tcp` observations are a **Discovery Source** for local SSH endpoints; SSH probing still decides **SSH Capability**.
+- Export/import should preserve user intent and **Identity Corrections**, but not volatile discovery observations or endpoint reachability.

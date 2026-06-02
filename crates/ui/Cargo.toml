@@ -6,9 +6,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 gpui.workspace = true
 network-manager-core = { path = "../core" }
+network-manager-db = { path = "../db" }
 serde.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
