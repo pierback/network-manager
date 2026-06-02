@@ -169,9 +169,41 @@ impl NetworkManager for DaemonService {
                 ));
             }
 
-            store
-                .list_endpoints_for_probe(mode != "full")
-                .map_err(internal_error)?
+            let requested_device = request.device_query.trim();
+            if requested_device.is_empty() {
+                store
+                    .list_endpoints_for_probe(mode != "full")
+                    .map_err(internal_error)?
+            } else {
+                match store
+                    .find_identity_id(requested_device)
+                    .map_err(internal_error)?
+                {
+                    IdentityLookup::Found(identity_id) => {
+                        let endpoints = store
+                            .endpoints_for_identity(&identity_id)
+                            .map_err(internal_error)?;
+                        messages.push(format!(
+                            "selected {} endpoint(s) for device refresh",
+                            endpoints.len()
+                        ));
+                        endpoints
+                    }
+                    IdentityLookup::NotFound => {
+                        messages.push(format!(
+                            "device '{requested_device}' was not found for targeted refresh"
+                        ));
+                        Vec::new()
+                    }
+                    IdentityLookup::Ambiguous(ids) => {
+                        messages.push(format!(
+                            "device query '{requested_device}' is ambiguous: {}",
+                            ids.join(", ")
+                        ));
+                        Vec::new()
+                    }
+                }
+            }
         };
 
         let probe_results = probe_ssh_endpoints(endpoints).await;
@@ -333,6 +365,10 @@ impl NetworkManager for DaemonService {
         let request = request.into_inner();
         let category = if request.clear {
             None
+        } else if request.category.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "category is required unless clear is true",
+            ));
         } else {
             Some(request.category.as_str())
         };
