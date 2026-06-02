@@ -53,6 +53,17 @@ pub struct LanDeviceObservation {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MdnsServiceObservation {
+    pub source_device_id: String,
+    pub service_name: String,
+    pub service_type: String,
+    pub domain: String,
+    pub hostname: Option<String>,
+    pub port: Option<u16>,
+    pub raw_text: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeviceDetails {
     pub identity: DeviceIdentity,
     pub endpoints: Vec<NetworkEndpoint>,
@@ -63,6 +74,78 @@ pub struct DeviceMutationResult {
     pub identity: DeviceIdentity,
     pub endpoint_count: usize,
     pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdentityCorrectionResult {
+    pub identity_id: String,
+    pub affected_identity_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserSettingsExport {
+    pub format_version: u32,
+    pub devices: Vec<DeviceSettingsExport>,
+    pub merges: Vec<MergeSettingsExport>,
+    pub splits: Vec<SplitSettingsExport>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeviceSettingsExport {
+    pub stable_key: String,
+    pub tracked_state: TrackedState,
+    pub label: Option<String>,
+    pub alias: Option<String>,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub ssh_username: Option<String>,
+    pub ssh_port: Option<u16>,
+    pub endpoint_preference: EndpointPreference,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MergeSettingsExport {
+    pub source_stable_key: String,
+    pub target_stable_key: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SplitSettingsExport {
+    pub source: String,
+    pub source_device_id: String,
+    pub target_stable_key: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserSettingsImportResult {
+    pub dry_run: bool,
+    pub devices_applied: usize,
+    pub devices_missing: usize,
+    pub merges_applied: usize,
+    pub merges_skipped: usize,
+    pub splits_applied: usize,
+    pub splits_skipped: usize,
+}
+
+struct LatestDiscoveryIdentity {
+    source: String,
+    source_device_id: String,
+    display_name: Option<String>,
+    identity_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct IntentSnapshot {
+    tracked_state: String,
+    label: Option<String>,
+    alias: Option<String>,
+    category: Option<String>,
+    ssh_username: Option<String>,
+    ssh_port: Option<i64>,
+    endpoint_preference: Option<String>,
 }
 
 pub struct SqliteStore {
@@ -95,7 +178,43 @@ impl SqliteStore {
         self.conn
             .execute_batch(INITIAL_MIGRATION)
             .context("applying initial SQLite migration")?;
+        self.ensure_post_initial_columns()?;
         Ok(())
+    }
+
+    fn ensure_post_initial_columns(&self) -> Result<()> {
+        if !self.table_has_column("device_identities", "merged_into_identity_id")? {
+            self.conn.execute(
+                "ALTER TABLE device_identities ADD COLUMN merged_into_identity_id TEXT REFERENCES device_identities(id) ON DELETE SET NULL",
+                [],
+            )?;
+        }
+        if !self.table_has_column("discovered_devices", "identity_override_id")? {
+            self.conn.execute(
+                "ALTER TABLE discovered_devices ADD COLUMN identity_override_id TEXT REFERENCES device_identities(id) ON DELETE SET NULL",
+                [],
+            )?;
+        }
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_device_identities_merged ON device_identities(merged_into_identity_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_discovered_devices_identity_override ON discovered_devices(identity_override_id)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn table_has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            if row? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn set_daemon_started(&self) -> Result<()> {
@@ -156,6 +275,7 @@ impl SqliteStore {
              FROM device_identities i
              LEFT JOIN device_user_intent ui ON ui.identity_id = i.id
              LEFT JOIN network_endpoints e ON e.identity_id = i.id
+             WHERE i.merged_into_identity_id IS NULL
              GROUP BY i.id, i.stable_key, ui.label, ui.alias, ui.tracked_state, ui.category, ui.ssh_username, ui.ssh_port, ui.endpoint_preference
              ORDER BY COALESCE(ui.alias, ui.label, i.stable_key)",
         )?;
@@ -202,12 +322,15 @@ impl SqliteStore {
                 d.display_name,
                 d.first_seen_at,
                 d.last_seen_at,
-                (
-                    SELECT o.identity_id
-                    FROM discovery_observations o
-                    WHERE o.discovered_device_id = d.id AND o.identity_id IS NOT NULL
-                    ORDER BY o.observed_at DESC, o.id DESC
-                    LIMIT 1
+                COALESCE(
+                    d.identity_override_id,
+                    (
+                        SELECT o.identity_id
+                        FROM discovery_observations o
+                        WHERE o.discovered_device_id = d.id AND o.identity_id IS NOT NULL
+                        ORDER BY o.observed_at DESC, o.id DESC
+                        LIMIT 1
+                    )
                 ) AS identity_id
              FROM discovered_devices d
              ORDER BY d.last_seen_at DESC, d.display_name, d.source_device_id",
@@ -227,8 +350,15 @@ impl SqliteStore {
             })
         })?;
 
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .context("listing discovered devices")
+        let mut records = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("listing discovered devices")?;
+        for record in &mut records {
+            if let Some(identity_id) = record.identity_id.take() {
+                record.identity_id = self.active_identity_id(&identity_id)?;
+            }
+        }
+        Ok(records)
     }
 
     pub fn endpoints_for_identity(&self, identity_id: &str) -> Result<Vec<NetworkEndpoint>> {
@@ -335,7 +465,7 @@ impl SqliteStore {
                 WHERE i.id = ?1 OR i.stable_key = ?1
 
                 UNION ALL
-                SELECT o.identity_id AS id, 3 AS priority
+                SELECT COALESCE(d.identity_override_id, o.identity_id) AS id, 3 AS priority
                 FROM discovered_devices d
                 JOIN discovery_observations o ON o.discovered_device_id = d.id
                 WHERE o.identity_id IS NOT NULL
@@ -350,9 +480,18 @@ impl SqliteStore {
              GROUP BY id
              ORDER BY MIN(priority), id",
         )?;
-        let matches = stmt
+        let raw_matches = stmt
             .query_map(params![query], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut matches = Vec::new();
+        for raw_id in raw_matches {
+            if let Some(active_id) = self.active_identity_id(&raw_id)? {
+                if !matches.contains(&active_id) {
+                    matches.push(active_id);
+                }
+            }
+        }
 
         Ok(match matches.len() {
             0 => IdentityLookup::NotFound,
@@ -372,9 +511,11 @@ impl SqliteStore {
 
         for node in nodes {
             let stable_key = format!("tailscale:{}", node.source_device_id);
-            let identity_id = self.identity_id_for_stable_key(&stable_key)?;
             let discovered_id =
                 self.discovered_id_for_source("tailscale", &node.source_device_id)?;
+            let identity_id = self
+                .identity_id_for_discovery("tailscale", &node.source_device_id, Some(&stable_key))?
+                .context("Tailscale observations require an identity")?;
             let display_name = node
                 .display_name
                 .clone()
@@ -451,22 +592,25 @@ impl SqliteStore {
                 .clone()
                 .unwrap_or_else(|| observation.ip_address.clone());
             let raw_json = serde_json::to_string(observation)?;
-            let identity_id = if let Some(mac) = observation
+            let fallback_stable_key = if let Some(mac) = observation
                 .mac_address
                 .as_deref()
                 .map(normalize_mac)
                 .filter(|value| !value.is_empty())
             {
-                Some(self.identity_id_for_stable_key(&format!("mac:{mac}"))?)
-            } else if let Some(hostname) = observation
-                .hostname
-                .as_deref()
-                .filter(|value| !value.is_empty())
-            {
-                Some(self.identity_id_for_stable_key(&format!("lan-host:{hostname}"))?)
+                Some(format!("mac:{mac}"))
             } else {
-                None
+                observation
+                    .hostname
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map(|hostname| format!("lan-host:{hostname}"))
             };
+            let identity_id = self.identity_id_for_discovery(
+                "arp",
+                &source_device_id,
+                fallback_stable_key.as_deref(),
+            )?;
 
             self.conn.execute(
                 "INSERT INTO discovered_devices(id, source, source_device_id, display_name, raw_json)
@@ -532,6 +676,86 @@ impl SqliteStore {
                     None,
                     "arp",
                     "unknown",
+                )?;
+            }
+        }
+
+        Ok(observations.len())
+    }
+
+    pub fn record_mdns_services(&self, observations: &[MdnsServiceObservation]) -> Result<usize> {
+        for observation in observations {
+            let source_device_id = if observation.source_device_id.trim().is_empty() {
+                format!(
+                    "{}:{}:{}",
+                    observation.domain, observation.service_type, observation.service_name
+                )
+            } else {
+                observation.source_device_id.clone()
+            };
+            let discovered_id = self.discovered_id_for_source("mdns", &source_device_id)?;
+            let raw_json = serde_json::to_string(observation)?;
+            let fallback_stable_key = observation
+                .hostname
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(|hostname| format!("mdns-host:{}", normalize_hostname(hostname)))
+                .unwrap_or_else(|| {
+                    format!(
+                        "mdns-service:{}:{}:{}",
+                        observation.domain, observation.service_type, observation.service_name
+                    )
+                });
+            let identity_id = self
+                .identity_id_for_discovery("mdns", &source_device_id, Some(&fallback_stable_key))?
+                .context("mDNS observations require an identity")?;
+
+            self.conn.execute(
+                "INSERT INTO discovered_devices(id, source, source_device_id, display_name, raw_json)
+                 VALUES (?1, 'mdns', ?2, ?3, ?4)
+                 ON CONFLICT(source, source_device_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    raw_json = excluded.raw_json,
+                    last_seen_at = CURRENT_TIMESTAMP",
+                params![
+                    discovered_id,
+                    source_device_id,
+                    observation.service_name,
+                    raw_json
+                ],
+            )?;
+
+            self.conn.execute(
+                "INSERT INTO discovery_observations(discovered_device_id, identity_id, source, evidence_json)
+                 VALUES (?1, ?2, 'mdns', ?3)",
+                params![discovered_id, identity_id, raw_json],
+            )?;
+
+            self.conn.execute(
+                "INSERT INTO identity_evidence(identity_id, discovered_device_id, evidence_type, evidence_value, confidence, source)
+                 VALUES (?1, ?2, 'mdns_service', ?3, 0.55, 'mdns')",
+                params![identity_id, discovered_id, observation.service_name],
+            )?;
+
+            if let Some(hostname) = observation
+                .hostname
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                let hostname = normalize_hostname(hostname);
+                self.conn.execute(
+                    "INSERT INTO identity_evidence(identity_id, discovered_device_id, evidence_type, evidence_value, confidence, source)
+                     VALUES (?1, ?2, 'hostname', ?3, 0.65, 'mdns')",
+                    params![identity_id, discovered_id, hostname],
+                )?;
+                self.upsert_endpoint(
+                    &identity_id,
+                    "mdns",
+                    hostname,
+                    observation.port,
+                    Some(hostname),
+                    "mdns",
+                    "online",
                 )?;
             }
         }
@@ -633,6 +857,46 @@ impl SqliteStore {
         self.mutation_result(identity_id, "alias updated")
     }
 
+    pub fn set_category_by_id(
+        &self,
+        identity_id: &str,
+        category: Option<&str>,
+    ) -> Result<DeviceMutationResult> {
+        self.ensure_intent_row(identity_id)?;
+        self.conn.execute(
+            "UPDATE device_user_intent SET category = ?2, updated_at = CURRENT_TIMESTAMP WHERE identity_id = ?1",
+            params![identity_id, category],
+        )?;
+        self.mutation_result(identity_id, "category updated")
+    }
+
+    pub fn add_tag_by_id(&self, identity_id: &str, tag: &str) -> Result<DeviceMutationResult> {
+        self.ensure_intent_row(identity_id)?;
+        let tag = normalize_tag(tag)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO device_tags(identity_id, tag) VALUES (?1, ?2)",
+            params![identity_id, tag],
+        )?;
+        self.conn.execute(
+            "UPDATE device_user_intent SET updated_at = CURRENT_TIMESTAMP WHERE identity_id = ?1",
+            params![identity_id],
+        )?;
+        self.mutation_result(identity_id, "tag added")
+    }
+
+    pub fn remove_tag_by_id(&self, identity_id: &str, tag: &str) -> Result<DeviceMutationResult> {
+        let tag = normalize_tag(tag)?;
+        self.conn.execute(
+            "DELETE FROM device_tags WHERE identity_id = ?1 AND tag = ?2",
+            params![identity_id, tag],
+        )?;
+        self.conn.execute(
+            "UPDATE device_user_intent SET updated_at = CURRENT_TIMESTAMP WHERE identity_id = ?1",
+            params![identity_id],
+        )?;
+        self.mutation_result(identity_id, "tag removed")
+    }
+
     pub fn set_ssh_username_by_id(
         &self,
         identity_id: &str,
@@ -672,6 +936,239 @@ impl SqliteStore {
         self.mutation_result(identity_id, "endpoint preference updated")
     }
 
+    pub fn merge_identities_by_id(
+        &self,
+        source_identity_id: &str,
+        target_identity_id: &str,
+        reason: Option<&str>,
+    ) -> Result<IdentityCorrectionResult> {
+        if source_identity_id == target_identity_id {
+            bail!("cannot merge an identity into itself");
+        }
+        self.assert_active_identity(source_identity_id)?;
+        self.assert_active_identity(target_identity_id)?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        let source_family = merged_family_ids(&tx, source_identity_id)?;
+        for merged_source_id in &source_family {
+            merge_endpoints(&tx, merged_source_id, target_identity_id)?;
+            tx.execute(
+                "UPDATE discovery_observations SET identity_id = ?2 WHERE identity_id = ?1",
+                params![merged_source_id, target_identity_id],
+            )?;
+            tx.execute(
+                "UPDATE identity_evidence SET identity_id = ?2 WHERE identity_id = ?1",
+                params![merged_source_id, target_identity_id],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO device_tags(identity_id, tag) SELECT ?2, tag FROM device_tags WHERE identity_id = ?1",
+                params![merged_source_id, target_identity_id],
+            )?;
+            tx.execute(
+                "DELETE FROM device_tags WHERE identity_id = ?1",
+                params![merged_source_id],
+            )?;
+            tx.execute(
+                "UPDATE discovered_devices SET identity_override_id = ?2 WHERE identity_override_id = ?1",
+                params![merged_source_id, target_identity_id],
+            )?;
+        }
+        merge_user_intent(&tx, source_identity_id, target_identity_id)?;
+        tx.execute(
+            "INSERT INTO identity_corrections(correction_type, from_identity_id, to_identity_id, reason) VALUES ('merge', ?1, ?2, ?3)",
+            params![source_identity_id, target_identity_id, reason],
+        )?;
+        tx.execute(
+            "UPDATE device_identities
+             SET merged_into_identity_id = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 OR merged_into_identity_id = ?1",
+            params![source_identity_id, target_identity_id],
+        )?;
+        tx.commit()?;
+
+        Ok(IdentityCorrectionResult {
+            identity_id: target_identity_id.to_string(),
+            affected_identity_id: source_identity_id.to_string(),
+            message: format!("merged {source_identity_id} into {target_identity_id}"),
+        })
+    }
+
+    pub fn split_discovered_device_by_id(
+        &self,
+        discovered_device_id: &str,
+        reason: Option<&str>,
+    ) -> Result<IdentityCorrectionResult> {
+        if let Some(existing_identity_id) =
+            self.identity_override_for_discovered_id(discovered_device_id)?
+        {
+            bail!(
+                "discovered device '{discovered_device_id}' is already split to identity '{existing_identity_id}'"
+            );
+        }
+        let latest = self
+            .latest_discovery_identity(discovered_device_id)?
+            .with_context(|| {
+                format!(
+                    "discovered device '{discovered_device_id}' was not found or has no identity"
+                )
+            })?;
+        let old_identity_id = self.resolve_active_identity_id(&latest.identity_id)?;
+        let new_identity_id = format!("identity-{}", Uuid::new_v4());
+        let stable_key = format!("split:{}:{}", latest.source, latest.source_device_id);
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO device_identities(id, stable_key) VALUES (?1, ?2)",
+            params![new_identity_id, stable_key],
+        )?;
+        tx.execute(
+            "UPDATE discovered_devices SET identity_override_id = ?2 WHERE id = ?1",
+            params![discovered_device_id, new_identity_id],
+        )?;
+        tx.execute(
+            "UPDATE discovery_observations SET identity_id = ?2 WHERE discovered_device_id = ?1",
+            params![discovered_device_id, new_identity_id],
+        )?;
+        tx.execute(
+            "UPDATE identity_evidence SET identity_id = ?2 WHERE discovered_device_id = ?1",
+            params![discovered_device_id, new_identity_id],
+        )?;
+        tx.execute(
+            "INSERT INTO identity_corrections(correction_type, from_identity_id, to_identity_id, reason) VALUES ('split', ?1, ?2, ?3)",
+            params![old_identity_id, new_identity_id, reason],
+        )?;
+        move_split_endpoints(
+            &tx,
+            &old_identity_id,
+            &new_identity_id,
+            discovered_device_id,
+        )?;
+        if let Some(label) = latest
+            .display_name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            tx.execute(
+                "INSERT INTO device_user_intent(identity_id, tracked_state, label) VALUES (?1, 'untracked', ?2)",
+                params![new_identity_id, label],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(IdentityCorrectionResult {
+            identity_id: new_identity_id,
+            affected_identity_id: old_identity_id,
+            message: format!("split discovered device {discovered_device_id} into a new identity"),
+        })
+    }
+
+    pub fn export_user_settings(&self) -> Result<UserSettingsExport> {
+        let devices = self
+            .list_device_identities()?
+            .into_iter()
+            .map(|record| record.identity)
+            .filter(should_export_device_settings)
+            .map(|identity| DeviceSettingsExport {
+                stable_key: identity.stable_key,
+                tracked_state: identity.tracked_state,
+                label: identity.label,
+                alias: identity.alias,
+                category: identity.category,
+                tags: identity.tags,
+                ssh_username: identity.ssh_username,
+                ssh_port: identity.ssh_port,
+                endpoint_preference: identity.endpoint_preference,
+            })
+            .collect();
+
+        Ok(UserSettingsExport {
+            format_version: 1,
+            devices,
+            merges: self.export_merge_settings()?,
+            splits: self.export_split_settings()?,
+        })
+    }
+
+    pub fn import_user_settings(
+        &self,
+        export: &UserSettingsExport,
+        dry_run: bool,
+    ) -> Result<UserSettingsImportResult> {
+        if export.format_version != 1 {
+            bail!(
+                "unsupported user settings export format version {}",
+                export.format_version
+            );
+        }
+
+        let mut result = UserSettingsImportResult {
+            dry_run,
+            devices_applied: 0,
+            devices_missing: 0,
+            merges_applied: 0,
+            merges_skipped: 0,
+            splits_applied: 0,
+            splits_skipped: 0,
+        };
+
+        for split in &export.splits {
+            let Some(discovered_id) =
+                self.discovered_id_for_existing_source(&split.source, &split.source_device_id)?
+            else {
+                result.splits_skipped += 1;
+                continue;
+            };
+            if self
+                .identity_override_for_source(&split.source, &split.source_device_id)?
+                .is_some()
+            {
+                result.splits_skipped += 1;
+                continue;
+            }
+            if !dry_run {
+                self.split_discovered_device_by_id(&discovered_id, split.reason.as_deref())?;
+            }
+            result.splits_applied += 1;
+        }
+
+        for merge in &export.merges {
+            let Some(source_id) =
+                self.identity_id_for_existing_stable_key(&merge.source_stable_key)?
+            else {
+                result.merges_skipped += 1;
+                continue;
+            };
+            let Some(target_id) =
+                self.identity_id_for_existing_stable_key(&merge.target_stable_key)?
+            else {
+                result.merges_skipped += 1;
+                continue;
+            };
+            if source_id == target_id {
+                result.merges_skipped += 1;
+                continue;
+            }
+            if !dry_run {
+                self.merge_identities_by_id(&source_id, &target_id, merge.reason.as_deref())?;
+            }
+            result.merges_applied += 1;
+        }
+
+        for device in &export.devices {
+            let Some(identity_id) = self.identity_id_for_existing_stable_key(&device.stable_key)?
+            else {
+                result.devices_missing += 1;
+                continue;
+            };
+            if !dry_run {
+                self.apply_device_settings(&identity_id, device)?;
+            }
+            result.devices_applied += 1;
+        }
+
+        Ok(result)
+    }
+
     pub fn insert_test_identity(&self, stable_key: &str, alias: Option<&str>) -> Result<String> {
         let id = format!("identity-{}", Uuid::new_v4());
         self.conn.execute(
@@ -685,17 +1182,262 @@ impl SqliteStore {
         Ok(id)
     }
 
+    fn export_merge_settings(&self) -> Result<Vec<MergeSettingsExport>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source.stable_key,
+                    target.stable_key,
+                    (
+                        SELECT reason
+                        FROM identity_corrections c
+                        WHERE c.correction_type = 'merge' AND c.from_identity_id = source.id
+                        ORDER BY c.created_at DESC, c.id DESC
+                        LIMIT 1
+                    ) AS reason
+             FROM device_identities source
+             JOIN device_identities target ON target.id = source.merged_into_identity_id
+             ORDER BY source.stable_key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(MergeSettingsExport {
+                source_stable_key: row.get(0)?,
+                target_stable_key: row.get(1)?,
+                reason: row.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("exporting merge settings")
+    }
+
+    fn export_split_settings(&self) -> Result<Vec<SplitSettingsExport>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.source,
+                    d.source_device_id,
+                    i.stable_key,
+                    (
+                        SELECT reason
+                        FROM identity_corrections c
+                        WHERE c.correction_type = 'split' AND c.to_identity_id = d.identity_override_id
+                        ORDER BY c.created_at DESC, c.id DESC
+                        LIMIT 1
+                    ) AS reason
+             FROM discovered_devices d
+             JOIN device_identities i ON i.id = d.identity_override_id
+             WHERE d.identity_override_id IS NOT NULL
+             ORDER BY d.source, d.source_device_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SplitSettingsExport {
+                source: row.get(0)?,
+                source_device_id: row.get(1)?,
+                target_stable_key: row.get(2)?,
+                reason: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("exporting split settings")
+    }
+
+    fn identity_id_for_existing_stable_key(&self, stable_key: &str) -> Result<Option<String>> {
+        match self.find_identity_id(stable_key)? {
+            IdentityLookup::Found(identity_id) => Ok(Some(identity_id)),
+            IdentityLookup::NotFound => Ok(None),
+            IdentityLookup::Ambiguous(ids) => {
+                bail!("stable key '{stable_key}' unexpectedly matched multiple identities: {ids:?}")
+            }
+        }
+    }
+
+    fn discovered_id_for_existing_source(
+        &self,
+        source: &str,
+        source_device_id: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM discovered_devices WHERE source = ?1 AND source_device_id = ?2",
+                params![source, source_device_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("looking up discovered device by source")
+    }
+
+    fn apply_device_settings(
+        &self,
+        identity_id: &str,
+        settings: &DeviceSettingsExport,
+    ) -> Result<()> {
+        self.ensure_intent_row(identity_id)?;
+        let alias = settings
+            .alias
+            .as_deref()
+            .map(|alias| self.unique_alias(identity_id, &slug_alias(alias)))
+            .transpose()?;
+        self.conn.execute(
+            "UPDATE device_user_intent
+             SET tracked_state = ?2,
+                 label = ?3,
+                 alias = ?4,
+                 category = ?5,
+                 ssh_username = ?6,
+                 ssh_port = ?7,
+                 endpoint_preference = ?8,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE identity_id = ?1",
+            params![
+                identity_id,
+                settings.tracked_state.as_str(),
+                settings.label.as_deref(),
+                alias.as_deref(),
+                settings.category.as_deref(),
+                settings.ssh_username.as_deref(),
+                settings.ssh_port.map(i64::from),
+                settings.endpoint_preference.as_str(),
+            ],
+        )?;
+        self.conn.execute(
+            "DELETE FROM device_tags WHERE identity_id = ?1",
+            params![identity_id],
+        )?;
+        for tag in &settings.tags {
+            let tag = normalize_tag(tag)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO device_tags(identity_id, tag) VALUES (?1, ?2)",
+                params![identity_id, tag],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn assert_active_identity(&self, identity_id: &str) -> Result<()> {
+        let exists: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM device_identities WHERE id = ?1 AND merged_into_identity_id IS NULL",
+                params![identity_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            bail!("active identity '{identity_id}' was not found");
+        }
+        Ok(())
+    }
+
+    fn latest_discovery_identity(
+        &self,
+        discovered_device_id: &str,
+    ) -> Result<Option<LatestDiscoveryIdentity>> {
+        self.conn
+            .query_row(
+                "SELECT d.source, d.source_device_id, d.display_name, o.identity_id
+                 FROM discovered_devices d
+                 JOIN discovery_observations o ON o.discovered_device_id = d.id
+                 WHERE d.id = ?1 AND o.identity_id IS NOT NULL
+                 ORDER BY o.observed_at DESC, o.id DESC
+                 LIMIT 1",
+                params![discovered_device_id],
+                |row| {
+                    Ok(LatestDiscoveryIdentity {
+                        source: row.get(0)?,
+                        source_device_id: row.get(1)?,
+                        display_name: row.get(2)?,
+                        identity_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("reading latest discovery identity")
+    }
+
+    fn identity_id_for_discovery(
+        &self,
+        source: &str,
+        source_device_id: &str,
+        fallback_stable_key: Option<&str>,
+    ) -> Result<Option<String>> {
+        if let Some(override_id) = self.identity_override_for_source(source, source_device_id)? {
+            return Ok(Some(override_id));
+        }
+        if let Some(existing_id) = self.latest_identity_for_source(source, source_device_id)? {
+            return Ok(Some(existing_id));
+        }
+        fallback_stable_key
+            .map(|stable_key| self.identity_id_for_stable_key(stable_key))
+            .transpose()
+    }
+
+    fn latest_identity_for_source(
+        &self,
+        source: &str,
+        source_device_id: &str,
+    ) -> Result<Option<String>> {
+        let identity_id = self
+            .conn
+            .query_row(
+                "SELECT o.identity_id
+                 FROM discovered_devices d
+                 JOIN discovery_observations o ON o.discovered_device_id = d.id
+                 WHERE d.source = ?1 AND d.source_device_id = ?2 AND o.identity_id IS NOT NULL
+                 ORDER BY o.observed_at DESC, o.id DESC
+                 LIMIT 1",
+                params![source, source_device_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        identity_id
+            .map(|identity_id| self.resolve_active_identity_id(&identity_id))
+            .transpose()
+    }
+
+    fn identity_override_for_source(
+        &self,
+        source: &str,
+        source_device_id: &str,
+    ) -> Result<Option<String>> {
+        let override_id = self
+            .conn
+            .query_row(
+                "SELECT identity_override_id FROM discovered_devices WHERE source = ?1 AND source_device_id = ?2",
+                params![source, source_device_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        override_id
+            .map(|identity_id| self.resolve_active_identity_id(&identity_id))
+            .transpose()
+    }
+
+    fn identity_override_for_discovered_id(
+        &self,
+        discovered_device_id: &str,
+    ) -> Result<Option<String>> {
+        let override_id = self
+            .conn
+            .query_row(
+                "SELECT identity_override_id FROM discovered_devices WHERE id = ?1",
+                params![discovered_device_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        override_id
+            .map(|identity_id| self.resolve_active_identity_id(&identity_id))
+            .transpose()
+    }
+
     fn identity_id_for_stable_key(&self, stable_key: &str) -> Result<String> {
         if let Some(id) = self
             .conn
             .query_row(
                 "SELECT id FROM device_identities WHERE stable_key = ?1",
                 params![stable_key],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
         {
-            return Ok(id);
+            return self.resolve_active_identity_id(&id);
         }
 
         let id = format!("identity-{}", Uuid::new_v4());
@@ -706,13 +1448,45 @@ impl SqliteStore {
         Ok(id)
     }
 
+    fn active_identity_id(&self, identity_id: &str) -> Result<Option<String>> {
+        let mut current = identity_id.to_string();
+        let mut seen = Vec::new();
+        for _ in 0..32 {
+            if seen.contains(&current) {
+                bail!("identity merge cycle involving '{identity_id}'");
+            }
+            seen.push(current.clone());
+            let row = self
+                .conn
+                .query_row(
+                    "SELECT id, merged_into_identity_id FROM device_identities WHERE id = ?1",
+                    params![current],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            let Some((id, merged_into_identity_id)) = row else {
+                return Ok(None);
+            };
+            let Some(next_id) = merged_into_identity_id else {
+                return Ok(Some(id));
+            };
+            current = next_id;
+        }
+        bail!("identity merge chain too deep for '{identity_id}'")
+    }
+
+    fn resolve_active_identity_id(&self, identity_id: &str) -> Result<String> {
+        self.active_identity_id(identity_id)?
+            .with_context(|| format!("identity '{identity_id}' was not found"))
+    }
+
     fn discovered_id_for_source(&self, source: &str, source_device_id: &str) -> Result<String> {
         if let Some(id) = self
             .conn
             .query_row(
                 "SELECT id FROM discovered_devices WHERE source = ?1 AND source_device_id = ?2",
                 params![source, source_device_id],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
             .optional()?
         {
@@ -894,15 +1668,54 @@ pub enum IdentityLookup {
     Ambiguous(Vec<String>),
 }
 
+fn should_export_device_settings(identity: &DeviceIdentity) -> bool {
+    identity.tracked_state != TrackedState::Untracked
+        || identity.label.is_some()
+        || identity.alias.is_some()
+        || identity.category.is_some()
+        || !identity.tags.is_empty()
+        || identity.ssh_username.is_some()
+        || identity.ssh_port.is_some()
+        || identity.endpoint_preference != EndpointPreference::Auto
+}
+
 fn normalize_mac(value: &str) -> String {
-    value
+    let parts = value
         .trim()
         .to_ascii_lowercase()
         .replace('-', ":")
         .split(':')
         .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(":")
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if parts.len() == 6 {
+        let parsed = parts
+            .iter()
+            .map(|part| u8::from_str_radix(part, 16))
+            .collect::<std::result::Result<Vec<_>, _>>();
+        if let Ok(bytes) = parsed {
+            return bytes
+                .into_iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(":");
+        }
+    }
+
+    parts.join(":")
+}
+
+fn normalize_hostname(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalize_tag(value: &str) -> Result<String> {
+    let tag = value.trim().to_ascii_lowercase();
+    if tag.is_empty() {
+        bail!("tag cannot be empty");
+    }
+    Ok(tag)
 }
 
 fn slug_alias(value: &str) -> String {
@@ -928,6 +1741,286 @@ fn slug_alias(value: &str) -> String {
     } else {
         output
     }
+}
+
+fn merged_family_ids(
+    tx: &rusqlite::Transaction<'_>,
+    source_identity_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT id FROM device_identities WHERE id = ?1 OR merged_into_identity_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![source_identity_id], |row| row.get::<_, String>(0))?;
+    let ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    if ids.is_empty() {
+        bail!("identity '{source_identity_id}' was not found");
+    }
+    Ok(ids)
+}
+
+fn merge_user_intent(
+    tx: &rusqlite::Transaction<'_>,
+    source_identity_id: &str,
+    target_identity_id: &str,
+) -> Result<()> {
+    let source = read_intent_snapshot(tx, source_identity_id)?;
+    let target = read_intent_snapshot(tx, target_identity_id)?;
+    if source.is_none() && target.is_none() {
+        return Ok(());
+    }
+
+    let merged = merge_intent_snapshots(source, target);
+    tx.execute(
+        "DELETE FROM device_user_intent WHERE identity_id = ?1",
+        params![source_identity_id],
+    )?;
+    tx.execute(
+        "INSERT INTO device_user_intent(
+            identity_id, tracked_state, label, alias, category, ssh_username, ssh_port, endpoint_preference
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(identity_id) DO UPDATE SET
+            tracked_state = excluded.tracked_state,
+            label = excluded.label,
+            alias = excluded.alias,
+            category = excluded.category,
+            ssh_username = excluded.ssh_username,
+            ssh_port = excluded.ssh_port,
+            endpoint_preference = excluded.endpoint_preference,
+            updated_at = CURRENT_TIMESTAMP",
+        params![
+            target_identity_id,
+            merged.tracked_state,
+            merged.label,
+            merged.alias,
+            merged.category,
+            merged.ssh_username,
+            merged.ssh_port,
+            merged.endpoint_preference,
+        ],
+    )?;
+    Ok(())
+}
+
+fn read_intent_snapshot(
+    tx: &rusqlite::Transaction<'_>,
+    identity_id: &str,
+) -> Result<Option<IntentSnapshot>> {
+    tx.query_row(
+        "SELECT tracked_state, label, alias, category, ssh_username, ssh_port, endpoint_preference
+         FROM device_user_intent
+         WHERE identity_id = ?1",
+        params![identity_id],
+        |row| {
+            Ok(IntentSnapshot {
+                tracked_state: row.get(0)?,
+                label: row.get(1)?,
+                alias: row.get(2)?,
+                category: row.get(3)?,
+                ssh_username: row.get(4)?,
+                ssh_port: row.get(5)?,
+                endpoint_preference: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .context("reading device user intent")
+}
+
+fn merge_intent_snapshots(
+    source: Option<IntentSnapshot>,
+    target: Option<IntentSnapshot>,
+) -> IntentSnapshot {
+    let source = source.unwrap_or_else(default_intent_snapshot);
+    let target = target.unwrap_or_else(default_intent_snapshot);
+    let tracked_state = if target.tracked_state == "untracked" {
+        source.tracked_state
+    } else {
+        target.tracked_state
+    };
+
+    IntentSnapshot {
+        tracked_state,
+        label: target.label.or(source.label),
+        alias: target.alias.or(source.alias),
+        category: target.category.or(source.category),
+        ssh_username: target.ssh_username.or(source.ssh_username),
+        ssh_port: target.ssh_port.or(source.ssh_port),
+        endpoint_preference: target.endpoint_preference.or(source.endpoint_preference),
+    }
+}
+
+fn default_intent_snapshot() -> IntentSnapshot {
+    IntentSnapshot {
+        tracked_state: "untracked".to_string(),
+        label: None,
+        alias: None,
+        category: None,
+        ssh_username: None,
+        ssh_port: None,
+        endpoint_preference: None,
+    }
+}
+
+fn merge_endpoints(
+    tx: &rusqlite::Transaction<'_>,
+    source_identity_id: &str,
+    target_identity_id: &str,
+) -> Result<()> {
+    let endpoints = {
+        let mut stmt = tx.prepare(
+            "SELECT id, kind, address, port FROM network_endpoints WHERE identity_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![source_identity_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    for (endpoint_id, kind, address, port) in endpoints {
+        let conflict: Option<String> = tx
+            .query_row(
+                "SELECT id FROM network_endpoints WHERE identity_id = ?1 AND kind = ?2 AND address = ?3 AND COALESCE(port, 0) = COALESCE(?4, 0)",
+                params![target_identity_id, kind, address, port],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(conflict_id) = conflict {
+            tx.execute(
+                "UPDATE network_endpoints
+                 SET hostname = COALESCE(hostname, (SELECT hostname FROM network_endpoints WHERE id = ?2)),
+                     reachable_state = CASE
+                        WHEN reachable_state = 'online'
+                          OR (SELECT reachable_state FROM network_endpoints WHERE id = ?2) = 'online' THEN 'online'
+                        WHEN reachable_state = 'unknown' THEN (SELECT reachable_state FROM network_endpoints WHERE id = ?2)
+                        ELSE reachable_state
+                     END,
+                     ssh_capability_state = CASE
+                        WHEN ssh_capability_state = 'online'
+                          OR (SELECT ssh_capability_state FROM network_endpoints WHERE id = ?2) = 'online' THEN 'online'
+                        WHEN ssh_capability_state = 'unknown' THEN (SELECT ssh_capability_state FROM network_endpoints WHERE id = ?2)
+                        ELSE ssh_capability_state
+                     END,
+                     last_seen_at = COALESCE(
+                        MAX(last_seen_at, (SELECT last_seen_at FROM network_endpoints WHERE id = ?2)),
+                        last_seen_at,
+                        (SELECT last_seen_at FROM network_endpoints WHERE id = ?2)
+                     ),
+                     last_checked_at = COALESCE(
+                        MAX(last_checked_at, (SELECT last_checked_at FROM network_endpoints WHERE id = ?2)),
+                        last_checked_at,
+                        (SELECT last_checked_at FROM network_endpoints WHERE id = ?2)
+                     ),
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                params![conflict_id, endpoint_id],
+            )?;
+            tx.execute(
+                "DELETE FROM network_endpoints WHERE id = ?1",
+                params![endpoint_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE network_endpoints SET identity_id = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![endpoint_id, target_identity_id],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn move_split_endpoints(
+    tx: &rusqlite::Transaction<'_>,
+    old_identity_id: &str,
+    new_identity_id: &str,
+    discovered_device_id: &str,
+) -> Result<()> {
+    let observations = {
+        let mut stmt = tx.prepare(
+            "SELECT source, evidence_json
+             FROM discovery_observations
+             WHERE discovered_device_id = ?1
+             ORDER BY observed_at, id",
+        )?;
+        let rows = stmt.query_map(params![discovered_device_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut addresses = Vec::new();
+    let mut hostnames = Vec::new();
+    for (source, evidence_json) in observations {
+        collect_endpoint_keys_from_evidence(
+            &source,
+            &evidence_json,
+            &mut addresses,
+            &mut hostnames,
+        )?;
+    }
+    addresses.sort();
+    addresses.dedup();
+    hostnames.sort();
+    hostnames.dedup();
+
+    for address in addresses.iter().filter(|value| !value.is_empty()) {
+        tx.execute(
+            "UPDATE network_endpoints SET identity_id = ?3, updated_at = CURRENT_TIMESTAMP WHERE identity_id = ?1 AND address = ?2",
+            params![old_identity_id, address, new_identity_id],
+        )?;
+    }
+    for hostname in hostnames.iter().filter(|value| !value.is_empty()) {
+        tx.execute(
+            "UPDATE network_endpoints SET identity_id = ?3, updated_at = CURRENT_TIMESTAMP WHERE identity_id = ?1 AND hostname = ?2",
+            params![old_identity_id, hostname, new_identity_id],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn collect_endpoint_keys_from_evidence(
+    source: &str,
+    evidence_json: &str,
+    addresses: &mut Vec<String>,
+    hostnames: &mut Vec<String>,
+) -> Result<()> {
+    match source {
+        "arp" => {
+            let observation: LanDeviceObservation =
+                serde_json::from_str(evidence_json).context("parsing LAN split evidence")?;
+            addresses.push(observation.ip_address);
+            if let Some(hostname) = observation.hostname {
+                addresses.push(hostname.clone());
+                hostnames.push(hostname);
+            }
+        }
+        "tailscale" => {
+            let observation: TailscaleNodeObservation =
+                serde_json::from_str(evidence_json).context("parsing Tailscale split evidence")?;
+            addresses.extend(observation.tailscale_ips);
+            if let Some(dns_name) = observation.dns_name {
+                addresses.push(dns_name.clone());
+                hostnames.push(dns_name);
+            }
+        }
+        "mdns" => {
+            let observation: MdnsServiceObservation =
+                serde_json::from_str(evidence_json).context("parsing mDNS split evidence")?;
+            if let Some(hostname) = observation.hostname {
+                let hostname = hostname.trim_end_matches('.').to_string();
+                addresses.push(hostname.clone());
+                hostnames.push(hostname);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn endpoint_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NetworkEndpoint> {
@@ -982,6 +2075,47 @@ mod tests {
 
         assert!(store.list_device_identities().unwrap().is_empty());
         assert!(store.list_discovered_devices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_upgrades_pre_identity_correction_schema() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE device_identities (
+                id TEXT PRIMARY KEY,
+                stable_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE discovered_devices (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_device_id TEXT NOT NULL,
+                display_name TEXT,
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (source, source_device_id)
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+
+        assert!(store
+            .table_has_column("device_identities", "merged_into_identity_id")
+            .unwrap());
+        assert!(store
+            .table_has_column("discovered_devices", "identity_override_id")
+            .unwrap());
     }
 
     #[test]
@@ -1058,5 +2192,413 @@ mod tests {
             .unwrap();
         assert_eq!(result.identity.tracked_state, TrackedState::Tracked);
         assert_eq!(result.identity.alias.as_deref(), Some("office-macbook"));
+    }
+
+    #[test]
+    fn records_mdns_services_as_local_ssh_endpoints() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+
+        store
+            .record_mdns_services(&[MdnsServiceObservation {
+                source_device_id: "local.:_ssh._tcp.:Office Mac".to_string(),
+                service_name: "Office Mac".to_string(),
+                service_type: "_ssh._tcp".to_string(),
+                domain: "local".to_string(),
+                hostname: Some("office-mac.local".to_string()),
+                port: Some(22),
+                raw_text: "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
+                    .to_string(),
+            }])
+            .unwrap();
+
+        let identities = store.list_device_identities().unwrap();
+        assert_eq!(identities.len(), 1);
+        let endpoints = store
+            .endpoints_for_identity(&identities[0].identity.id)
+            .unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].kind, EndpointKind::Mdns);
+        assert_eq!(endpoints[0].hostname.as_deref(), Some("office-mac.local"));
+        assert_eq!(endpoints[0].port, Some(22));
+    }
+
+    #[test]
+    fn mdns_unresolved_then_resolved_service_keeps_identity() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+        let source_device_id = "local.:_ssh._tcp.:Office Mac".to_string();
+
+        store
+            .record_mdns_services(&[MdnsServiceObservation {
+                source_device_id: source_device_id.clone(),
+                service_name: "Office Mac".to_string(),
+                service_type: "_ssh._tcp".to_string(),
+                domain: "local".to_string(),
+                hostname: None,
+                port: None,
+                raw_text: "Office Mac._ssh._tcp.local.".to_string(),
+            }])
+            .unwrap();
+        let first_identity = store
+            .list_device_identities()
+            .unwrap()
+            .remove(0)
+            .identity
+            .id;
+
+        store
+            .record_mdns_services(&[MdnsServiceObservation {
+                source_device_id,
+                service_name: "Office Mac".to_string(),
+                service_type: "_ssh._tcp".to_string(),
+                domain: "local".to_string(),
+                hostname: Some("office-mac.local".to_string()),
+                port: Some(22),
+                raw_text: "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
+                    .to_string(),
+            }])
+            .unwrap();
+
+        let identities = store.list_device_identities().unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].identity.id, first_identity);
+        assert_eq!(
+            store
+                .endpoints_for_identity(&identities[0].identity.id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn exports_and_imports_user_settings_for_matching_stable_keys() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("source.sqlite");
+        let source_store = SqliteStore::open(&source_path).unwrap();
+        source_store.migrate().unwrap();
+        let source_id = source_store
+            .insert_test_identity("tailscale:portable-node", Some("portable"))
+            .unwrap();
+        source_store
+            .set_label_by_id(&source_id, "Portable Mac")
+            .unwrap();
+        source_store
+            .set_category_by_id(&source_id, Some("laptop"))
+            .unwrap();
+        source_store.add_tag_by_id(&source_id, "Agents").unwrap();
+        source_store
+            .set_ssh_username_by_id(&source_id, Some("agent"))
+            .unwrap();
+        source_store
+            .set_ssh_port_by_id(&source_id, Some(2222))
+            .unwrap();
+        source_store
+            .set_endpoint_preference_by_id(&source_id, EndpointPreference::LocalFirst)
+            .unwrap();
+
+        let export = source_store.export_user_settings().unwrap();
+        assert_eq!(export.devices.len(), 1);
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.sqlite");
+        let target_store = SqliteStore::open(&target_path).unwrap();
+        target_store.migrate().unwrap();
+        let target_id = target_store
+            .insert_test_identity("tailscale:portable-node", None)
+            .unwrap();
+
+        let result = target_store.import_user_settings(&export, false).unwrap();
+        assert_eq!(result.devices_applied, 1);
+        assert_eq!(result.devices_missing, 0);
+
+        let details = target_store
+            .device_details_by_id(&target_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(details.identity.tracked_state, TrackedState::Tracked);
+        assert_eq!(details.identity.label.as_deref(), Some("Portable Mac"));
+        assert_eq!(details.identity.alias.as_deref(), Some("portable"));
+        assert_eq!(details.identity.category.as_deref(), Some("laptop"));
+        assert_eq!(details.identity.tags, vec!["agents".to_string()]);
+        assert_eq!(details.identity.ssh_username.as_deref(), Some("agent"));
+        assert_eq!(details.identity.ssh_port, Some(2222));
+        assert_eq!(
+            details.identity.endpoint_preference,
+            EndpointPreference::LocalFirst
+        );
+    }
+
+    #[test]
+    fn merge_hides_source_and_redirects_lookup() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+        let source = store
+            .insert_test_identity("manual:source", Some("source"))
+            .unwrap();
+        let target = store
+            .insert_test_identity("manual:target", Some("target"))
+            .unwrap();
+
+        store
+            .merge_identities_by_id(&source, &target, Some("test merge"))
+            .unwrap();
+
+        assert_eq!(
+            store.find_identity_id(&source).unwrap(),
+            IdentityLookup::Found(target.clone())
+        );
+        assert_eq!(
+            store.find_identity_id("manual:source").unwrap(),
+            IdentityLookup::Found(target)
+        );
+        assert_eq!(store.list_device_identities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_transfers_source_intent_when_target_has_no_alias() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+        let source = store
+            .insert_test_identity("manual:source-intent", Some("source-alias"))
+            .unwrap();
+        let target = format!("identity-{}", Uuid::new_v4());
+        store
+            .conn
+            .execute(
+                "INSERT INTO device_identities(id, stable_key) VALUES (?1, 'manual:target-intent')",
+                params![target],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO device_user_intent(identity_id, tracked_state) VALUES (?1, 'untracked')",
+                params![target],
+            )
+            .unwrap();
+
+        store
+            .merge_identities_by_id(&source, &target, Some("test merge"))
+            .unwrap();
+
+        let details = store.device_details_by_id(&target).unwrap().unwrap();
+        assert_eq!(details.identity.tracked_state, TrackedState::Tracked);
+        assert_eq!(details.identity.alias.as_deref(), Some("source-alias"));
+    }
+
+    #[test]
+    fn merge_target_intent_wins_conflicts_and_tags_union() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+        let source = store
+            .insert_test_identity("manual:source-conflict", Some("source-alias"))
+            .unwrap();
+        store
+            .set_category_by_id(&source, Some("source-cat"))
+            .unwrap();
+        store
+            .set_ssh_username_by_id(&source, Some("source-user"))
+            .unwrap();
+        store.set_ssh_port_by_id(&source, Some(2200)).unwrap();
+        store
+            .set_endpoint_preference_by_id(&source, EndpointPreference::LocalFirst)
+            .unwrap();
+        store.add_tag_by_id(&source, "source-tag").unwrap();
+
+        let target = store
+            .insert_test_identity("manual:target-conflict", Some("target-alias"))
+            .unwrap();
+        store
+            .set_tracked_state_by_id(&target, TrackedState::Ignored, None, None)
+            .unwrap();
+        store
+            .set_category_by_id(&target, Some("target-cat"))
+            .unwrap();
+        store
+            .set_ssh_username_by_id(&target, Some("target-user"))
+            .unwrap();
+        store.set_ssh_port_by_id(&target, Some(2222)).unwrap();
+        store
+            .set_endpoint_preference_by_id(&target, EndpointPreference::TailscaleFirst)
+            .unwrap();
+        store.add_tag_by_id(&target, "target-tag").unwrap();
+
+        store
+            .merge_identities_by_id(&source, &target, None)
+            .unwrap();
+
+        let details = store.device_details_by_id(&target).unwrap().unwrap();
+        assert_eq!(details.identity.tracked_state, TrackedState::Ignored);
+        assert_eq!(details.identity.alias.as_deref(), Some("target-alias"));
+        assert_eq!(details.identity.category.as_deref(), Some("target-cat"));
+        assert_eq!(
+            details.identity.ssh_username.as_deref(),
+            Some("target-user")
+        );
+        assert_eq!(details.identity.ssh_port, Some(2222));
+        assert_eq!(
+            details.identity.endpoint_preference,
+            EndpointPreference::TailscaleFirst
+        );
+        assert_eq!(details.identity.tags, vec!["source-tag", "target-tag"]);
+    }
+
+    #[test]
+    fn merge_chains_resolve_to_final_active_identity() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+        let first = store
+            .insert_test_identity("manual:first", Some("first"))
+            .unwrap();
+        let second = store.insert_test_identity("manual:second", None).unwrap();
+        let third = store.insert_test_identity("manual:third", None).unwrap();
+
+        store.merge_identities_by_id(&first, &second, None).unwrap();
+        store.merge_identities_by_id(&second, &third, None).unwrap();
+
+        assert_eq!(
+            store.find_identity_id("manual:first").unwrap(),
+            IdentityLookup::Found(third.clone())
+        );
+        assert_eq!(
+            store.find_identity_id("manual:second").unwrap(),
+            IdentityLookup::Found(third.clone())
+        );
+        assert_eq!(
+            store.find_identity_id("first").unwrap(),
+            IdentityLookup::Found(third)
+        );
+        assert_eq!(store.list_device_identities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rediscovery_after_merge_stays_on_target_identity() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+        let observation = LanDeviceObservation {
+            ip_address: "192.168.1.10".to_string(),
+            hostname: Some("Office MacBook".to_string()),
+            mac_address: Some("AA:BB:CC:00:11:22".to_string()),
+            interface_name: Some("en0".to_string()),
+            raw_text: "Office MacBook (192.168.1.10) at aa:bb:cc:00:11:22 on en0".to_string(),
+        };
+        store
+            .record_lan_devices(std::slice::from_ref(&observation))
+            .unwrap();
+        let source = match store.find_identity_id("mac:aa:bb:cc:00:11:22").unwrap() {
+            IdentityLookup::Found(id) => id,
+            other => panic!("expected LAN identity, got {other:?}"),
+        };
+        let target = store
+            .insert_test_identity("manual:target-rediscovery", None)
+            .unwrap();
+
+        store
+            .merge_identities_by_id(&source, &target, None)
+            .unwrap();
+        store.record_lan_devices(&[observation]).unwrap();
+
+        assert_eq!(
+            store.find_identity_id("mac:aa:bb:cc:00:11:22").unwrap(),
+            IdentityLookup::Found(target.clone())
+        );
+        let endpoints = store.endpoints_for_identity(&target).unwrap();
+        assert!(endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "192.168.1.10"));
+        assert_eq!(store.list_device_identities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn split_discovered_lan_device_moves_matching_endpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+        let observation = LanDeviceObservation {
+            ip_address: "192.168.1.10".to_string(),
+            hostname: Some("Office MacBook".to_string()),
+            mac_address: Some("AA:BB:CC:00:11:22".to_string()),
+            interface_name: Some("en0".to_string()),
+            raw_text: "Office MacBook (192.168.1.10) at aa:bb:cc:00:11:22 on en0".to_string(),
+        };
+        store
+            .record_lan_devices(std::slice::from_ref(&observation))
+            .unwrap();
+        let mut second_observation = observation.clone();
+        second_observation.ip_address = "192.168.1.11".to_string();
+        second_observation.raw_text =
+            "Office MacBook (192.168.1.11) at aa:bb:cc:00:11:22 on en0".to_string();
+        store
+            .record_lan_devices(std::slice::from_ref(&second_observation))
+            .unwrap();
+        let discovered_record = store.list_discovered_devices().unwrap().remove(0);
+        let discovered = discovered_record.device.id;
+        let old_identity_id = discovered_record.identity_id.unwrap();
+
+        let result = store
+            .split_discovered_device_by_id(&discovered, Some("test split"))
+            .unwrap();
+        store.record_lan_devices(&[observation]).unwrap();
+        let endpoints = store.endpoints_for_identity(&result.identity_id).unwrap();
+        let old_endpoints = store.endpoints_for_identity(&old_identity_id).unwrap();
+        let discovered_record = store
+            .list_discovered_devices()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.device.id == discovered)
+            .unwrap();
+        let stale_evidence_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM identity_evidence WHERE discovered_device_id = ?1 AND identity_id = ?2",
+                params![&discovered, &old_identity_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let new_evidence_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM identity_evidence WHERE discovered_device_id = ?1 AND identity_id = ?2",
+                params![&discovered, &result.identity_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(endpoints.len(), 3);
+        assert!(endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "192.168.1.10"));
+        assert!(endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "192.168.1.11"));
+        assert!(!old_endpoints.iter().any(
+            |endpoint| endpoint.address == "192.168.1.10" || endpoint.address == "192.168.1.11"
+        ));
+        assert_eq!(
+            discovered_record.identity_id,
+            Some(result.identity_id.clone())
+        );
+        assert_eq!(stale_evidence_count, 0);
+        assert!(new_evidence_count > 0);
+        assert!(store
+            .split_discovered_device_by_id(&discovered, Some("again"))
+            .is_err());
     }
 }

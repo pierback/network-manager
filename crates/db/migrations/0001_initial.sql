@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS daemon_metadata (
 CREATE TABLE IF NOT EXISTS device_identities (
     id TEXT PRIMARY KEY,
     stable_key TEXT NOT NULL UNIQUE,
+    merged_into_identity_id TEXT REFERENCES device_identities(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS discovered_devices (
     source_device_id TEXT NOT NULL,
     display_name TEXT,
     raw_json TEXT NOT NULL DEFAULT '{}',
+    identity_override_id TEXT REFERENCES device_identities(id) ON DELETE SET NULL,
     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (source, source_device_id)

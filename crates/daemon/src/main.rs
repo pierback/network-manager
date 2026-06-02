@@ -4,7 +4,8 @@ use network_manager_core::{
     resolve_ssh_target, AvailabilityState, EndpointPreference, NetworkEndpoint,
 };
 use network_manager_db::{
-    IdentityLookup, LanDeviceObservation, SqliteStore, TailscaleNodeObservation,
+    IdentityLookup, LanDeviceObservation, MdnsServiceObservation, SqliteStore,
+    TailscaleNodeObservation,
 };
 use network_manager_ipc::pb::network_manager_server::{NetworkManager, NetworkManagerServer};
 use network_manager_ipc::pb::{
@@ -14,7 +15,7 @@ use network_manager_ipc::pb::{
     ResolveSshTargetResponse,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -80,6 +81,7 @@ impl NetworkManager for DaemonService {
         } else {
             None
         };
+        let mdns_result = refresh_mdns_ssh().await;
         let lan_result = refresh_lan_arp().await;
 
         let mut accepted = false;
@@ -91,65 +93,76 @@ impl NetworkManager for DaemonService {
             store.set_daemon_heartbeat().map_err(internal_error)?;
 
             match tailscale_result {
-            Ok(snapshot) => {
-                store
-                    .set_metadata("tailscale_service_state", &snapshot.backend_state)
-                    .map_err(internal_error)?;
-                let count = store
-                    .record_tailscale_nodes(snapshot.tailnet.as_deref(), &snapshot.nodes)
-                    .map_err(internal_error)?;
-                accepted = true;
-                messages.push(format!("recorded {count} Tailscale device(s)"));
-            }
-            Err(error) => {
-                store
-                    .set_metadata("tailscale_service_state", "unavailable")
-                    .map_err(internal_error)?;
-                messages.push(format!("Tailscale unavailable: {error}"));
-            }
-        }
-
-        if let Some(active_probe_result) = active_probe_result {
-            match active_probe_result {
-                Ok(ips) => {
-                    messages.push(format!("probed {} LAN address(es)", ips.len()));
-                    active_lan_ips = ips;
+                Ok(snapshot) => {
+                    store
+                        .set_metadata("tailscale_service_state", &snapshot.backend_state)
+                        .map_err(internal_error)?;
+                    let count = store
+                        .record_tailscale_nodes(snapshot.tailnet.as_deref(), &snapshot.nodes)
+                        .map_err(internal_error)?;
+                    accepted = true;
+                    messages.push(format!("recorded {count} Tailscale device(s)"));
                 }
-                Err(error) => messages.push(format!("active LAN probe unavailable: {error}")),
+                Err(error) => {
+                    store
+                        .set_metadata("tailscale_service_state", "unavailable")
+                        .map_err(internal_error)?;
+                    messages.push(format!("Tailscale unavailable: {error}"));
+                }
             }
-        }
 
-        match lan_result {
-            Ok(observations) => {
-                let count = store
-                    .record_lan_devices(&observations)
+            if let Some(active_probe_result) = active_probe_result {
+                match active_probe_result {
+                    Ok(ips) => {
+                        messages.push(format!("probed {} LAN address(es)", ips.len()));
+                        active_lan_ips = ips;
+                    }
+                    Err(error) => messages.push(format!("active LAN probe unavailable: {error}")),
+                }
+            }
+
+            match mdns_result {
+                Ok(observations) => {
+                    let count = store
+                        .record_mdns_services(&observations)
+                        .map_err(internal_error)?;
+                    accepted = true;
+                    messages.push(format!("recorded {count} mDNS SSH service(s)"));
+                }
+                Err(error) => messages.push(format!("mDNS unavailable: {error}")),
+            }
+
+            match lan_result {
+                Ok(observations) => {
+                    let count = store
+                        .record_lan_devices(&observations)
+                        .map_err(internal_error)?;
+                    accepted = true;
+                    messages.push(format!("recorded {count} LAN ARP device(s)"));
+                }
+                Err(error) => messages.push(format!("LAN ARP unavailable: {error}")),
+            }
+
+            if !active_lan_ips.is_empty() {
+                let ip_strings = active_lan_ips
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                let changed = store
+                    .mark_lan_ips_reachable(&ip_strings)
                     .map_err(internal_error)?;
-                accepted = true;
-                messages.push(format!("recorded {count} LAN ARP device(s)"));
+                messages.push(format!("marked {changed} LAN endpoint(s) reachable"));
             }
-            Err(error) => messages.push(format!("LAN ARP unavailable: {error}")),
-        }
 
-        if !active_lan_ips.is_empty() {
-            let ip_strings = active_lan_ips
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            let changed = store
-                .mark_lan_ips_reachable(&ip_strings)
+            let stale_after_seconds = if mode == "full" { 900 } else { 120 };
+            let stale_count = store
+                .mark_stale_endpoint_checks_unknown(stale_after_seconds)
                 .map_err(internal_error)?;
-            messages.push(format!("marked {changed} LAN endpoint(s) reachable"));
-        }
-
-        let stale_after_seconds = if mode == "full" { 900 } else { 120 };
-        let stale_count = store
-            .mark_stale_endpoint_checks_unknown(stale_after_seconds)
-            .map_err(internal_error)?;
-        if stale_count > 0 {
-            messages.push(format!(
-                "marked {stale_count} stale endpoint check(s) unknown"
-            ));
-        }
+            if stale_count > 0 {
+                messages.push(format!(
+                    "marked {stale_count} stale endpoint check(s) unknown"
+                ));
+            }
 
             store
                 .list_endpoints_for_probe(mode != "full")
@@ -551,6 +564,153 @@ async fn ping_once(ip: Ipv4Addr) -> Option<Ipv4Addr> {
     matches!(status, Ok(Ok(status)) if status.success()).then_some(ip)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MdnsBrowseService {
+    service_name: String,
+    service_type: String,
+    domain: String,
+    raw_line: String,
+}
+
+async fn refresh_mdns_ssh() -> Result<Vec<MdnsServiceObservation>> {
+    let browse_output = capture_dns_sd(
+        &[
+            "-B".to_string(),
+            "_ssh._tcp".to_string(),
+            "local.".to_string(),
+        ],
+        Duration::from_secs(2),
+    )
+    .await?;
+    let services = parse_dns_sd_browse(&browse_output);
+    let mut observations = Vec::new();
+
+    for service in services.into_iter().take(16) {
+        let resolve_output = capture_dns_sd(
+            &[
+                "-L".to_string(),
+                service.service_name.clone(),
+                service.service_type.clone(),
+                format!("{}.", service.domain),
+            ],
+            Duration::from_millis(1500),
+        )
+        .await
+        .unwrap_or_default();
+        let (hostname, port) = parse_dns_sd_resolve(&resolve_output)
+            .map(|(hostname, port)| (Some(hostname), Some(port)))
+            .unwrap_or((None, None));
+        let raw_text = if resolve_output.trim().is_empty() {
+            service.raw_line.clone()
+        } else {
+            format!("{}\n{}", service.raw_line, resolve_output.trim())
+        };
+
+        observations.push(MdnsServiceObservation {
+            source_device_id: format!(
+                "{}:{}:{}",
+                service.domain, service.service_type, service.service_name
+            ),
+            service_name: service.service_name,
+            service_type: service.service_type,
+            domain: service.domain,
+            hostname,
+            port,
+            raw_text,
+        });
+    }
+
+    Ok(observations)
+}
+
+async fn capture_dns_sd(args: &[String], duration: Duration) -> Result<String> {
+    let mut command = tokio::process::Command::new("dns-sd");
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("running dns-sd {}", args.join(" ")))?;
+
+    tokio::time::sleep(duration).await;
+    let _ = child.start_kill();
+    let output = tokio::time::timeout(Duration::from_secs(1), child.wait_with_output())
+        .await
+        .context("waiting for dns-sd to exit")?
+        .context("reading dns-sd output")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stdout.trim().is_empty() && !stderr.is_empty() {
+        anyhow::bail!("dns-sd {} failed: {stderr}", args.join(" "));
+    }
+    Ok(stdout)
+}
+
+fn parse_dns_sd_browse(output: &str) -> Vec<MdnsBrowseService> {
+    let mut seen = HashSet::new();
+    let mut services = Vec::new();
+
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        let Some(action_index) = parts.iter().position(|part| *part == "Add") else {
+            continue;
+        };
+        if parts.len() <= action_index + 5 {
+            continue;
+        }
+        let domain = trim_dns_sd_field(parts[action_index + 3]);
+        let service_type = trim_dns_sd_field(parts[action_index + 4]);
+        if service_type != "_ssh._tcp" {
+            continue;
+        }
+        let service_name = parts[action_index + 5..].join(" ");
+        if service_name.is_empty() {
+            continue;
+        }
+        let key = format!("{domain}:{service_type}:{service_name}");
+        if seen.insert(key) {
+            services.push(MdnsBrowseService {
+                service_name,
+                service_type,
+                domain,
+                raw_line: line.to_string(),
+            });
+        }
+    }
+
+    services
+}
+
+fn parse_dns_sd_resolve(output: &str) -> Option<(String, u16)> {
+    for line in output.lines() {
+        let Some((_, rest)) = line.split_once(" can be reached at ") else {
+            continue;
+        };
+        let host_port = rest.split(" (").next().unwrap_or(rest).trim();
+        let Some((hostname, port)) = host_port.rsplit_once(':') else {
+            continue;
+        };
+        let hostname = hostname.trim().trim_end_matches('.').to_string();
+        let Ok(port) = port.trim().parse::<u16>() else {
+            continue;
+        };
+        if !hostname.is_empty() {
+            return Some((hostname, port));
+        }
+    }
+    None
+}
+
+fn trim_dns_sd_field(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_string()
+}
+
 #[derive(Debug)]
 struct EndpointProbeResult {
     endpoint_id: String,
@@ -563,8 +723,10 @@ async fn probe_ssh_endpoints(endpoints: Vec<NetworkEndpoint>) -> Vec<EndpointPro
     for chunk in endpoints.chunks(32) {
         let handles = chunk
             .iter()
-            .cloned()
-            .map(|endpoint| tokio::spawn(async move { probe_ssh_endpoint(endpoint).await }))
+            .map(|endpoint| {
+                let endpoint = endpoint.clone();
+                tokio::spawn(async move { probe_ssh_endpoint(endpoint).await })
+            })
             .collect::<Vec<_>>();
         for handle in handles {
             if let Ok(result) = handle.await {
@@ -765,4 +927,31 @@ fn secure_socket_permissions(path: &std::path::Path) -> Result<()> {
 #[cfg(not(unix))]
 fn secure_socket_permissions(_path: &std::path::Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dns_sd_browse_services_with_spaces() {
+        let output = "Browsing for _ssh._tcp.local.\nTimestamp     A/R    Flags  if Domain               Service Type         Instance Name\n13:05:01.000  Add        3  14 local.               _ssh._tcp.          Office MacBook Pro\n13:05:02.000  Rmv        0  14 local.               _ssh._tcp.          Old Host\n";
+
+        let services = parse_dns_sd_browse(output);
+
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].domain, "local");
+        assert_eq!(services[0].service_type, "_ssh._tcp");
+        assert_eq!(services[0].service_name, "Office MacBook Pro");
+    }
+
+    #[test]
+    fn parses_dns_sd_resolve_target() {
+        let output = "Lookup Office MacBook Pro._ssh._tcp.local.\nOffice MacBook Pro._ssh._tcp.local. can be reached at office-macbook.local.:2222 (interface 14)\n";
+
+        assert_eq!(
+            parse_dns_sd_resolve(output),
+            Some(("office-macbook.local".to_string(), 2222))
+        );
+    }
 }

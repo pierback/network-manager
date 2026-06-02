@@ -1,18 +1,25 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use network_manager_core::{resolve_ssh_target, EndpointPreference, SshTarget, TrackedState};
-use network_manager_db::{DeviceMutationResult, IdentityLookup, SqliteStore};
+use network_manager_core::{
+    resolve_ssh_target, AvailabilityState, EndpointKind, EndpointPreference, SshTarget,
+    TrackedState,
+};
+use network_manager_db::{
+    DeviceMutationResult, IdentityCorrectionResult, IdentityLookup, SqliteStore, UserSettingsExport,
+};
 use network_manager_ipc::pb::{
     GetDaemonStatusRequest, ListDeviceIdentitiesRequest, ListDiscoveredDevicesRequest,
     RefreshRequest, ResolveSshTargetRequest,
 };
 use serde::Serialize;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 const EXIT_NOT_FOUND: i32 = 20;
 const EXIT_AMBIGUOUS: i32 = 21;
 const EXIT_UNAVAILABLE: i32 = 22;
 const EXIT_DAEMON_DOWN: i32 = 23;
+const DEFAULT_LAUNCH_AGENT_LABEL: &str = "com.network-manager.daemon";
 
 #[derive(Debug, Parser)]
 #[command(name = "network-manager", about = "Agent-friendly Network Manager CLI")]
@@ -69,6 +76,16 @@ enum Command {
     Label(LabelArgs),
     /// Set the CLI-friendly unique alias.
     Alias(AliasArgs),
+    /// Set or clear the device category.
+    Category(CategoryArgs),
+    /// Add a tag to a device.
+    Tag(TagArgs),
+    /// Remove a tag from a device.
+    Untag(TagArgs),
+    /// Merge one identity into another.
+    Merge(MergeArgs),
+    /// Split one discovered device into a separate identity.
+    Split(SplitArgs),
     /// Discovery commands.
     Discover {
         #[command(subcommand)]
@@ -76,8 +93,16 @@ enum Command {
     },
     /// Resolve a device to an SSH target.
     Resolve(ResolveArgs),
+    /// Poll device status until interrupted.
+    Watch(WatchArgs),
     /// Request a bounded daemon refresh.
     Refresh(RefreshArgs),
+    /// Emit local diagnostic counts and paths.
+    Diagnostics(DiagnosticsArgs),
+    /// Export portable user settings as JSON.
+    Export(ExportArgs),
+    /// Import portable user settings JSON.
+    Import(ImportArgs),
     /// Exec into ssh for the resolved device.
     Ssh(SshArgs),
 }
@@ -98,6 +123,42 @@ enum PathKind {
 enum DaemonCommand {
     /// Show daemon status.
     Status,
+    /// Print the LaunchAgent plist that would be installed.
+    Plist(DaemonPlistArgs),
+    /// Install a per-user LaunchAgent plist.
+    Install(DaemonInstallArgs),
+    /// Remove the per-user LaunchAgent plist.
+    Uninstall(DaemonLabelArgs),
+    /// Start the installed LaunchAgent.
+    Start(DaemonLabelArgs),
+    /// Stop the installed LaunchAgent.
+    Stop(DaemonLabelArgs),
+}
+
+#[derive(Debug, Args)]
+struct DaemonPlistArgs {
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    daemon_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DaemonInstallArgs {
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    daemon_path: Option<PathBuf>,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    load: bool,
+}
+
+#[derive(Debug, Args)]
+struct DaemonLabelArgs {
+    #[arg(long)]
+    label: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -122,6 +183,16 @@ enum DevicesCommand {
     SshPort(SshPortArgs),
     /// Set endpoint preference for SSH resolution.
     Preference(PreferenceArgs),
+    /// Set or clear the device category.
+    Category(CategoryArgs),
+    /// Add a tag to a device.
+    Tag(TagArgs),
+    /// Remove a tag from a device.
+    Untag(TagArgs),
+    /// Merge one identity into another.
+    Merge(MergeArgs),
+    /// Split one discovered device into a separate identity.
+    Split(SplitArgs),
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +201,15 @@ struct DeviceListArgs {
     tracked: bool,
     #[arg(long)]
     ignored: bool,
+    /// Only devices with at least one online endpoint.
+    #[arg(long)]
+    online: bool,
+    /// Only devices with at least one endpoint accepting SSH.
+    #[arg(long)]
+    ssh: bool,
+    /// Filter by endpoint source/kind group: lan, tailscale, lan_ip, mdns, etc.
+    #[arg(long)]
+    source: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +236,36 @@ struct LabelArgs {
 struct AliasArgs {
     device: String,
     alias: String,
+}
+
+#[derive(Debug, Args)]
+struct CategoryArgs {
+    device: String,
+    category: Option<String>,
+    #[arg(long)]
+    clear: bool,
+}
+
+#[derive(Debug, Args)]
+struct TagArgs {
+    device: String,
+    tag: String,
+}
+
+#[derive(Debug, Args)]
+struct MergeArgs {
+    source: String,
+    target: String,
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct SplitArgs {
+    /// Discovered device id from `network-manager discover list`.
+    discovered_id: String,
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -200,6 +310,21 @@ struct ResolveArgs {
 }
 
 #[derive(Debug, Args)]
+struct WatchArgs {
+    /// Seconds between polls.
+    #[arg(long, default_value_t = 5)]
+    interval: u64,
+    /// Run one poll and exit.
+    #[arg(long)]
+    once: bool,
+    /// Ask the daemon for a quick refresh before each poll.
+    #[arg(long)]
+    refresh: bool,
+    #[command(flatten)]
+    filters: DeviceListArgs,
+}
+
+#[derive(Debug, Args)]
 struct RefreshArgs {
     #[arg(long, conflicts_with = "full")]
     quick: bool,
@@ -207,6 +332,28 @@ struct RefreshArgs {
     full: bool,
     #[arg(long)]
     device: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsArgs {
+    /// Include raw local paths instead of redacted paths.
+    #[arg(long)]
+    no_redact: bool,
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    /// Output path. Omit or pass '-' to write to stdout.
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ImportArgs {
+    /// Input path. Omit or pass '-' to read from stdin.
+    path: Option<PathBuf>,
+    /// Validate and count what would be applied without writing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -235,6 +382,12 @@ impl CliPreference {
             Self::TailscaleFirst => EndpointPreference::TailscaleFirst,
             Self::LanFirst => EndpointPreference::LanFirst,
         }
+    }
+}
+
+impl DeviceListArgs {
+    fn has_endpoint_filters(&self) -> bool {
+        self.online || self.ssh || self.source.is_some()
     }
 }
 
@@ -291,6 +444,13 @@ struct MutationOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct CorrectionOutput {
+    message: String,
+    identity_id: String,
+    affected_identity_id: String,
+}
+
+#[derive(Debug, Serialize)]
 struct DiscoveredOutput {
     id: String,
     source: String,
@@ -316,6 +476,55 @@ struct ResolveOutput {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+struct DiagnosticsOutput {
+    daemon: StatusOutput,
+    paths: DiagnosticsPaths,
+    counts: DiagnosticsCounts,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticsPaths {
+    db: String,
+    socket: String,
+    launch_agent: String,
+    logs: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticsCounts {
+    identities: usize,
+    tracked: usize,
+    ignored: usize,
+    discovered: usize,
+    endpoints: usize,
+    online_endpoints: usize,
+    ssh_endpoints: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct WatchOutput {
+    observed_at: String,
+    devices: Vec<DeviceOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct DaemonPlistOutput {
+    label: String,
+    daemon_path: String,
+    db_path: String,
+    socket_path: String,
+    plist: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DaemonActionOutput {
+    action: String,
+    label: String,
+    path: Option<String>,
+    message: String,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -337,6 +546,11 @@ async fn run() -> Result<()> {
             .unwrap_or_else(network_manager_ipc::default_socket_path),
     };
 
+    if cli.offline && cli.require_daemon {
+        eprintln!("--offline conflicts with --require-daemon");
+        std::process::exit(EXIT_DAEMON_DOWN);
+    }
+
     match &cli.command {
         Command::Paths(args) => {
             match args.kind {
@@ -344,12 +558,85 @@ async fn run() -> Result<()> {
                 PathKind::Socket => print_value(&paths.socket.display().to_string(), cli.json),
             }?;
         }
-        Command::Daemon {
-            command: DaemonCommand::Status,
-        } => {
-            let status = daemon_status(&cli, &paths).await?;
-            print_struct(&status, cli.json)?;
-        }
+        Command::Daemon { command } => match command {
+            DaemonCommand::Status => {
+                let status = daemon_status(&cli, &paths).await?;
+                print_struct(&status, cli.json)?;
+            }
+            DaemonCommand::Plist(args) => {
+                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+                let daemon_path = canonical_daemon_path(
+                    &args
+                        .daemon_path
+                        .clone()
+                        .unwrap_or_else(default_daemon_binary_path),
+                )?;
+                let plist = launch_agent_plist(label, &daemon_path, &paths)?;
+                let output = DaemonPlistOutput {
+                    label: label.to_string(),
+                    daemon_path: daemon_path.display().to_string(),
+                    db_path: paths.db.display().to_string(),
+                    socket_path: paths.socket.display().to_string(),
+                    plist,
+                };
+                if cli.json {
+                    print_struct(&output, true)?;
+                } else {
+                    println!("{}", output.plist);
+                }
+            }
+            DaemonCommand::Install(args) => {
+                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+                let daemon_path = canonical_daemon_path(
+                    &args
+                        .daemon_path
+                        .clone()
+                        .unwrap_or_else(default_daemon_binary_path),
+                )?;
+                let plist_path = install_launch_agent(label, &daemon_path, &paths, args.force)?;
+                let mut message = format!("installed {}", plist_path.display());
+                if args.load {
+                    launchctl_bootstrap(label)?;
+                    message = format!("{message}; started {label}");
+                }
+                print_daemon_action("install", label, Some(&plist_path), &message, cli.json)?;
+            }
+            DaemonCommand::Uninstall(args) => {
+                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+                validate_launch_agent_label(label)?;
+                launchctl_bootout(label).ok();
+                let path = launch_agent_path(label);
+                let message = if path.exists() {
+                    std::fs::remove_file(&path)?;
+                    format!("removed {}", path.display())
+                } else {
+                    format!("{} was not installed", path.display())
+                };
+                print_daemon_action("uninstall", label, Some(&path), &message, cli.json)?;
+            }
+            DaemonCommand::Start(args) => {
+                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+                launchctl_bootstrap(label)?;
+                print_daemon_action(
+                    "start",
+                    label,
+                    Some(&launch_agent_path(label)),
+                    &format!("started {label}"),
+                    cli.json,
+                )?;
+            }
+            DaemonCommand::Stop(args) => {
+                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+                launchctl_bootout(label)?;
+                print_daemon_action(
+                    "stop",
+                    label,
+                    Some(&launch_agent_path(label)),
+                    &format!("stopped {label}"),
+                    cli.json,
+                )?;
+            }
+        },
         Command::Devices { command } => match command {
             DevicesCommand::List(args) => {
                 let devices = list_devices(&cli, &paths, args).await?;
@@ -396,6 +683,19 @@ async fn run() -> Result<()> {
                 let result = store.set_alias_by_id(&identity_id, &args.alias)?;
                 print_mutation(result, cli.json)?;
             }
+            DevicesCommand::Category(args) => {
+                let result =
+                    set_category(&paths, &args.device, args.category.as_deref(), args.clear)?;
+                print_mutation(result, cli.json)?;
+            }
+            DevicesCommand::Tag(args) => {
+                let result = add_tag(&paths, &args.device, &args.tag)?;
+                print_mutation(result, cli.json)?;
+            }
+            DevicesCommand::Untag(args) => {
+                let result = remove_tag(&paths, &args.device, &args.tag)?;
+                print_mutation(result, cli.json)?;
+            }
             DevicesCommand::SshUser(args) => {
                 let store = open_store(&paths.db)?;
                 let identity_id = lookup_or_exit(&store, &args.device)?;
@@ -420,6 +720,15 @@ async fn run() -> Result<()> {
                 let result =
                     store.set_endpoint_preference_by_id(&identity_id, args.preference.as_core())?;
                 print_mutation(result, cli.json)?;
+            }
+            DevicesCommand::Merge(args) => {
+                let result =
+                    merge_identities(&paths, &args.source, &args.target, args.reason.as_deref())?;
+                print_correction(result, cli.json)?;
+            }
+            DevicesCommand::Split(args) => {
+                let result = split_discovered(&paths, &args.discovered_id, args.reason.as_deref())?;
+                print_correction(result, cli.json)?;
             }
         },
         Command::List(args) => {
@@ -462,6 +771,27 @@ async fn run() -> Result<()> {
             let result = store.set_alias_by_id(&identity_id, &args.alias)?;
             print_mutation(result, cli.json)?;
         }
+        Command::Category(args) => {
+            let result = set_category(&paths, &args.device, args.category.as_deref(), args.clear)?;
+            print_mutation(result, cli.json)?;
+        }
+        Command::Tag(args) => {
+            let result = add_tag(&paths, &args.device, &args.tag)?;
+            print_mutation(result, cli.json)?;
+        }
+        Command::Untag(args) => {
+            let result = remove_tag(&paths, &args.device, &args.tag)?;
+            print_mutation(result, cli.json)?;
+        }
+        Command::Merge(args) => {
+            let result =
+                merge_identities(&paths, &args.source, &args.target, args.reason.as_deref())?;
+            print_correction(result, cli.json)?;
+        }
+        Command::Split(args) => {
+            let result = split_discovered(&paths, &args.discovered_id, args.reason.as_deref())?;
+            print_correction(result, cli.json)?;
+        }
         Command::Discover {
             command: DiscoverCommand::List,
         } => {
@@ -473,12 +803,16 @@ async fn run() -> Result<()> {
             if cli.json {
                 print_struct(&resolved, true)?;
             } else if args.ssh_command {
+                ensure_resolved(&resolved)?;
                 println!("ssh {}", resolved.ssh_args.join(" "));
             } else {
                 ensure_resolved(&resolved)?;
                 let destination = ssh_destination(&resolved);
                 println!("{destination}");
             }
+        }
+        Command::Watch(args) => {
+            watch_devices(&cli, &paths, args).await?;
         }
         Command::Refresh(args) => {
             let mode = if args.full { "full" } else { "quick" };
@@ -499,6 +833,17 @@ async fn run() -> Result<()> {
                 println!("{}", response.message);
             }
         }
+        Command::Diagnostics(args) => {
+            let diagnostics = diagnostics(&cli, &paths, !args.no_redact).await?;
+            print_struct(&diagnostics, cli.json)?;
+        }
+        Command::Export(args) => {
+            export_settings(&paths, args.path.as_deref())?;
+        }
+        Command::Import(args) => {
+            let result = import_settings(&paths, args.path.as_deref(), args.dry_run)?;
+            print_struct(&result, cli.json)?;
+        }
         Command::Ssh(args) => {
             let resolved = resolve(&cli, &paths, &args.device, args.preference.as_core()).await?;
             ensure_resolved(&resolved)?;
@@ -513,6 +858,227 @@ async fn run() -> Result<()> {
 struct Paths {
     db: PathBuf,
     socket: PathBuf,
+}
+
+fn default_daemon_binary_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("network-manager-daemon"))
+        })
+        .unwrap_or_else(|| PathBuf::from("network-manager-daemon"))
+}
+
+fn launch_agent_path(label: &str) -> PathBuf {
+    home_dir()
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{label}.plist"))
+}
+
+fn validate_launch_agent_label(label: &str) -> Result<()> {
+    if label.is_empty() {
+        return Err(anyhow!("LaunchAgent label cannot be empty"));
+    }
+    if label.contains('/') || label.contains('\\') || label.contains("..") {
+        return Err(anyhow!(
+            "LaunchAgent label contains an unsafe path component"
+        ));
+    }
+    if !label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(anyhow!(
+            "LaunchAgent label may contain only ASCII letters, digits, '.', '_' and '-'"
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_daemon_path(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolving daemon binary path {}", path.display()))?;
+    if !canonical.is_file() {
+        return Err(anyhow!(
+            "daemon binary is not a file: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn print_daemon_action(
+    action: &str,
+    label: &str,
+    path: Option<&Path>,
+    message: &str,
+    json: bool,
+) -> Result<()> {
+    let output = DaemonActionOutput {
+        action: action.to_string(),
+        label: label.to_string(),
+        path: path.map(|path| path.display().to_string()),
+        message: message.to_string(),
+    };
+    if json {
+        print_struct(&output, true)
+    } else {
+        println!("{}", output.message);
+        Ok(())
+    }
+}
+
+fn log_dir() -> PathBuf {
+    home_dir()
+        .join("Library")
+        .join("Logs")
+        .join("Network Manager")
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn launch_agent_plist(label: &str, daemon_path: &Path, paths: &Paths) -> Result<String> {
+    validate_launch_agent_label(label)?;
+    if !daemon_path.is_absolute() {
+        return Err(anyhow!("daemon binary path must be absolute"));
+    }
+    let logs = log_dir();
+    let stdout = logs.join("daemon.log");
+    let stderr = logs.join("daemon.err.log");
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{daemon}</string>
+    <string>--db</string>
+    <string>{db}</string>
+    <string>--socket</string>
+    <string>{socket}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{stdout}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr}</string>
+</dict>
+</plist>
+"#,
+        label = xml_escape(label),
+        daemon = xml_escape(&daemon_path.display().to_string()),
+        db = xml_escape(&paths.db.display().to_string()),
+        socket = xml_escape(&paths.socket.display().to_string()),
+        stdout = xml_escape(&stdout.display().to_string()),
+        stderr = xml_escape(&stderr.display().to_string()),
+    ))
+}
+
+fn install_launch_agent(
+    label: &str,
+    daemon_path: &Path,
+    paths: &Paths,
+    force: bool,
+) -> Result<PathBuf> {
+    validate_launch_agent_label(label)?;
+    if !daemon_path.is_absolute() || !daemon_path.is_file() {
+        return Err(anyhow!(
+            "daemon binary must be an absolute file path: {}",
+            daemon_path.display()
+        ));
+    }
+    let plist_path = launch_agent_path(label);
+    if plist_path.exists() && !force {
+        return Err(anyhow!(
+            "LaunchAgent already exists at {}; use --force to overwrite",
+            plist_path.display()
+        ));
+    }
+    if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir_all(log_dir())?;
+    if let Some(parent) = paths.db.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = paths.socket.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let plist = launch_agent_plist(label, daemon_path, paths)?;
+    std::fs::write(&plist_path, plist)?;
+    Ok(plist_path)
+}
+
+fn launchctl_bootstrap(label: &str) -> Result<()> {
+    validate_launch_agent_label(label)?;
+    let plist_path = launch_agent_path(label);
+    if !plist_path.exists() {
+        return Err(anyhow!(
+            "LaunchAgent is not installed: {}",
+            plist_path.display()
+        ));
+    }
+    run_launchctl(&[
+        "bootstrap".to_string(),
+        gui_domain()?,
+        plist_path.display().to_string(),
+    ])
+}
+
+fn launchctl_bootout(label: &str) -> Result<()> {
+    validate_launch_agent_label(label)?;
+    let service = format!("{}/{}", gui_domain()?, label);
+    run_launchctl(&["bootout".to_string(), service])
+}
+
+fn run_launchctl(args: &[String]) -> Result<()> {
+    let output = std::process::Command::new("launchctl")
+        .args(args)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(anyhow!("launchctl exited with status {}", output.status))
+        } else {
+            Err(anyhow!(
+                "launchctl exited with status {}: {stderr}",
+                output.status
+            ))
+        }
+    }
+}
+
+fn gui_domain() -> Result<String> {
+    let output = std::process::Command::new("id").arg("-u").output()?;
+    if !output.status.success() {
+        return Err(anyhow!("id -u failed"));
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(format!("gui/{uid}"))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 async fn daemon_status(cli: &Cli, paths: &Paths) -> Result<StatusOutput> {
@@ -555,12 +1121,204 @@ async fn daemon_status(cli: &Cli, paths: &Paths) -> Result<StatusOutput> {
     })
 }
 
+async fn diagnostics(cli: &Cli, paths: &Paths, redact: bool) -> Result<DiagnosticsOutput> {
+    let daemon = daemon_status(cli, paths).await?;
+    let store = open_store(&paths.db)?;
+    let identities = store.list_device_identities()?;
+    let discovered = store.list_discovered_devices()?;
+
+    let mut endpoints = 0;
+    let mut online_endpoints = 0;
+    let mut ssh_endpoints = 0;
+    for identity in &identities {
+        for endpoint in store.endpoints_for_identity(&identity.identity.id)? {
+            endpoints += 1;
+            if endpoint.reachability == AvailabilityState::Online {
+                online_endpoints += 1;
+            }
+            if endpoint.ssh_capability == AvailabilityState::Online {
+                ssh_endpoints += 1;
+            }
+        }
+    }
+
+    let paths_output = DiagnosticsPaths {
+        db: format_diagnostic_path(&paths.db, redact),
+        socket: format_diagnostic_path(&paths.socket, redact),
+        launch_agent: format_diagnostic_path(
+            &launch_agent_path(DEFAULT_LAUNCH_AGENT_LABEL),
+            redact,
+        ),
+        logs: format_diagnostic_path(&log_dir(), redact),
+    };
+
+    Ok(DiagnosticsOutput {
+        daemon,
+        paths: paths_output,
+        counts: DiagnosticsCounts {
+            tracked: identities
+                .iter()
+                .filter(|identity| identity.identity.tracked_state == TrackedState::Tracked)
+                .count(),
+            ignored: identities
+                .iter()
+                .filter(|identity| identity.identity.tracked_state == TrackedState::Ignored)
+                .count(),
+            identities: identities.len(),
+            discovered: discovered.len(),
+            endpoints,
+            online_endpoints,
+            ssh_endpoints,
+        },
+    })
+}
+
+fn format_diagnostic_path(path: &Path, redact: bool) -> String {
+    if !redact {
+        return path.display().to_string();
+    }
+    let home = home_dir();
+    match path.strip_prefix(&home) {
+        Ok(relative) => PathBuf::from("~").join(relative).display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+async fn watch_devices(cli: &Cli, paths: &Paths, args: &WatchArgs) -> Result<()> {
+    if args.interval == 0 && !args.once {
+        return Err(anyhow!(
+            "--interval must be greater than 0 unless --once is used"
+        ));
+    }
+
+    loop {
+        if args.refresh && !cli.offline {
+            refresh_quick_for_watch(cli, paths).await?;
+        }
+        let output = WatchOutput {
+            observed_at: unix_timestamp_string(),
+            devices: list_devices(cli, paths, &args.filters).await?,
+        };
+        if cli.json {
+            println!("{}", serde_json::to_string(&output)?);
+        } else {
+            print_watch_output(&output);
+        }
+
+        if args.once {
+            break;
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(args.interval)) => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn refresh_quick_for_watch(cli: &Cli, paths: &Paths) -> Result<()> {
+    match network_manager_ipc::connect_uds(&paths.socket).await {
+        Ok(mut client) => {
+            client
+                .refresh(RefreshRequest {
+                    mode: "quick".to_string(),
+                    device_query: String::new(),
+                })
+                .await?;
+        }
+        Err(error) if cli.require_daemon => {
+            eprintln!("daemon unavailable: {error:#}");
+            std::process::exit(EXIT_DAEMON_DOWN);
+        }
+        Err(error) => eprintln!("watch refresh skipped; daemon unavailable: {error:#}"),
+    }
+    Ok(())
+}
+
+fn print_watch_output(output: &WatchOutput) {
+    println!(
+        "[{}] {} device(s)",
+        output.observed_at,
+        output.devices.len()
+    );
+    for device in &output.devices {
+        let name = device
+            .alias
+            .as_deref()
+            .or(device.label.as_deref())
+            .unwrap_or(&device.stable_key);
+        let tags = if device.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" tags={}", device.tags.join(","))
+        };
+        let category = device
+            .category
+            .as_deref()
+            .map(|category| format!(" category={category}"))
+            .unwrap_or_default();
+        println!(
+            "  {name} id={} state={} endpoints={}{}{}",
+            device.id, device.tracked_state, device.endpoint_count, category, tags
+        );
+    }
+}
+
+fn unix_timestamp_string() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs().to_string(),
+        Err(_) => "0".to_string(),
+    }
+}
+
+fn export_settings(paths: &Paths, path: Option<&Path>) -> Result<()> {
+    let store = open_store(&paths.db)?;
+    let document = store.export_user_settings()?;
+    let text = serde_json::to_string_pretty(&document)?;
+    match path.filter(|path| path.as_os_str() != "-") {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, format!("{text}\n"))?;
+        }
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
+fn import_settings(
+    paths: &Paths,
+    path: Option<&Path>,
+    dry_run: bool,
+) -> Result<network_manager_db::UserSettingsImportResult> {
+    let mut text = String::new();
+    match path.filter(|path| path.as_os_str() != "-") {
+        Some(path) => text = std::fs::read_to_string(path)?,
+        None => {
+            std::io::stdin().read_to_string(&mut text)?;
+        }
+    }
+    let document: UserSettingsExport = serde_json::from_str(&text)?;
+    let store = open_store(&paths.db)?;
+    store.import_user_settings(&document, dry_run)
+}
+
 async fn list_devices(
     cli: &Cli,
     paths: &Paths,
     args: &DeviceListArgs,
 ) -> Result<Vec<DeviceOutput>> {
-    if !cli.offline {
+    if !cli.offline && args.has_endpoint_filters() && cli.require_daemon {
+        if let Err(error) = network_manager_ipc::connect_uds(&paths.socket).await {
+            eprintln!("daemon unavailable: {error:#}");
+            std::process::exit(EXIT_DAEMON_DOWN);
+        }
+    }
+
+    if !cli.offline && !args.has_endpoint_filters() {
         match network_manager_ipc::connect_uds(&paths.socket).await {
             Ok(mut client) => {
                 let response = client
@@ -607,6 +1365,15 @@ async fn list_devices(
     if args.ignored {
         records.retain(|record| record.identity.tracked_state.as_str() == "ignored");
     }
+    if args.has_endpoint_filters() {
+        let mut filtered = Vec::new();
+        for record in records {
+            if device_matches_endpoint_filters(&store, &record.identity.id, args)? {
+                filtered.push(record);
+            }
+        }
+        records = filtered;
+    }
     Ok(records
         .into_iter()
         .map(|record| DeviceOutput {
@@ -624,6 +1391,58 @@ async fn list_devices(
             endpoint_count: record.endpoint_count,
         })
         .collect())
+}
+
+fn device_matches_endpoint_filters(
+    store: &SqliteStore,
+    identity_id: &str,
+    args: &DeviceListArgs,
+) -> Result<bool> {
+    let endpoints = store.endpoints_for_identity(identity_id)?;
+    if args.online
+        && !endpoints
+            .iter()
+            .any(|endpoint| endpoint.reachability == AvailabilityState::Online)
+    {
+        return Ok(false);
+    }
+    if args.ssh
+        && !endpoints
+            .iter()
+            .any(|endpoint| endpoint.ssh_capability == AvailabilityState::Online)
+    {
+        return Ok(false);
+    }
+    if let Some(source) = args.source.as_deref() {
+        let source = validate_endpoint_source_filter(source)?;
+        if !endpoints
+            .iter()
+            .any(|endpoint| endpoint_kind_matches_source(endpoint.kind, &source))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_endpoint_source_filter(source: &str) -> Result<String> {
+    let source = source.to_ascii_lowercase();
+    match source.as_str() {
+        "arp" | "lan" | "ts" | "tailscale" | "lan_dns" | "mdns" | "lan_ip"
+        | "tailscale_dns" | "tailscale_ip" | "other" => Ok(source),
+        _ => Err(anyhow!(
+            "unknown endpoint source '{source}' (expected lan, arp, mdns, tailscale, lan_ip, lan_dns, tailscale_ip, tailscale_dns, or other)"
+        )),
+    }
+}
+
+fn endpoint_kind_matches_source(kind: EndpointKind, source: &str) -> bool {
+    match source {
+        "arp" => matches!(kind, EndpointKind::LanDns | EndpointKind::LanIp),
+        "lan" => kind.is_lan(),
+        "ts" | "tailscale" => kind.is_tailscale(),
+        other => kind.as_str() == other,
+    }
 }
 
 async fn list_discovered(cli: &Cli, paths: &Paths) -> Result<Vec<DiscoveredOutput>> {
@@ -713,6 +1532,55 @@ fn mutate_tracked_state(
     store.set_tracked_state_by_id(&identity_id, state, label, alias)
 }
 
+fn set_category(
+    paths: &Paths,
+    query: &str,
+    category: Option<&str>,
+    clear: bool,
+) -> Result<DeviceMutationResult> {
+    let store = open_store(&paths.db)?;
+    let identity_id = lookup_or_exit(&store, query)?;
+    let category = if clear {
+        None
+    } else {
+        Some(category.ok_or_else(|| anyhow!("category is required unless --clear is used"))?)
+    };
+    store.set_category_by_id(&identity_id, category)
+}
+
+fn add_tag(paths: &Paths, query: &str, tag: &str) -> Result<DeviceMutationResult> {
+    let store = open_store(&paths.db)?;
+    let identity_id = lookup_or_exit(&store, query)?;
+    store.add_tag_by_id(&identity_id, tag)
+}
+
+fn remove_tag(paths: &Paths, query: &str, tag: &str) -> Result<DeviceMutationResult> {
+    let store = open_store(&paths.db)?;
+    let identity_id = lookup_or_exit(&store, query)?;
+    store.remove_tag_by_id(&identity_id, tag)
+}
+
+fn merge_identities(
+    paths: &Paths,
+    source_query: &str,
+    target_query: &str,
+    reason: Option<&str>,
+) -> Result<IdentityCorrectionResult> {
+    let store = open_store(&paths.db)?;
+    let source_id = lookup_or_exit(&store, source_query)?;
+    let target_id = lookup_or_exit(&store, target_query)?;
+    store.merge_identities_by_id(&source_id, &target_id, reason)
+}
+
+fn split_discovered(
+    paths: &Paths,
+    discovered_id: &str,
+    reason: Option<&str>,
+) -> Result<IdentityCorrectionResult> {
+    let store = open_store(&paths.db)?;
+    store.split_discovered_device_by_id(discovered_id, reason)
+}
+
 fn lookup_or_exit(store: &SqliteStore, query: &str) -> Result<String> {
     match store.find_identity_id(query)? {
         IdentityLookup::Found(identity_id) => Ok(identity_id),
@@ -724,6 +1592,22 @@ fn lookup_or_exit(store: &SqliteStore, query: &str) -> Result<String> {
             eprintln!("device query '{query}' is ambiguous: {}", ids.join(", "));
             std::process::exit(EXIT_AMBIGUOUS);
         }
+    }
+}
+
+fn print_correction(result: IdentityCorrectionResult, json: bool) -> Result<()> {
+    let output = CorrectionOutput {
+        message: result.message,
+        identity_id: result.identity_id,
+        affected_identity_id: result.affected_identity_id,
+    };
+    if json {
+        print_struct(&output, true)
+    } else {
+        println!("{}", output.message);
+        println!("identity: {}", output.identity_id);
+        println!("affected: {}", output.affected_identity_id);
+        Ok(())
     }
 }
 
