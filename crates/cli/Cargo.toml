@@ -1,0 +1,21 @@
+[package]
+name = "network-manager-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "network-manager"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+network-manager-core = { path = "../core" }
+network-manager-db = { path = "../db" }
+network-manager-ipc = { path = "../ipc" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tonic.workspace = true

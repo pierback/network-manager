@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package network_manager.v1;
+
+service NetworkManager {
+  rpc GetDaemonStatus(GetDaemonStatusRequest) returns (DaemonStatusResponse);
+  rpc Refresh(RefreshRequest) returns (RefreshResponse);
+  rpc ListDeviceIdentities(ListDeviceIdentitiesRequest) returns (ListDeviceIdentitiesResponse);
+  rpc ListDiscoveredDevices(ListDiscoveredDevicesRequest) returns (ListDiscoveredDevicesResponse);
+  rpc ResolveSshTarget(ResolveSshTargetRequest) returns (ResolveSshTargetResponse);
+}
+
+message GetDaemonStatusRequest {}
+
+message DaemonStatusResponse {
+  string state = 1;
+  string source = 2;
+  string db_path = 3;
+  string started_at = 4;
+  string updated_at = 5;
+  bool stale = 6;
+}
+
+message RefreshRequest {
+  string mode = 1;
+  string device_query = 2;
+}
+
+message RefreshResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ListDeviceIdentitiesRequest {
+  bool tracked_only = 1;
+  bool ignored_only = 2;
+}
+
+message DeviceIdentity {
+  string id = 1;
+  string stable_key = 2;
+  string label = 3;
+  string alias = 4;
+  string tracked_state = 5;
+  string category = 6;
+  repeated string tags = 7;
+  string ssh_username = 8;
+  uint32 ssh_port = 9;
+  string endpoint_preference = 10;
+  string last_seen_at = 11;
+  uint32 endpoint_count = 12;
+}
+
+message ListDeviceIdentitiesResponse {
+  repeated DeviceIdentity identities = 1;
+}
+
+message ListDiscoveredDevicesRequest {}
+
+message DiscoveredDevice {
+  string id = 1;
+  string source = 2;
+  string source_device_id = 3;
+  string display_name = 4;
+  string first_seen_at = 5;
+  string last_seen_at = 6;
+  string identity_id = 7;
+}
+
+message ListDiscoveredDevicesResponse {
+  repeated DiscoveredDevice devices = 1;
+}
+
+message ResolveSshTargetRequest {
+  string device_query = 1;
+  string endpoint_preference = 2;
+}
+
+message ResolveSshTargetResponse {
+  bool found = 1;
+  bool ambiguous = 2;
+  repeated string candidate_identity_ids = 3;
+  string endpoint_id = 4;
+  string host = 5;
+  uint32 port = 6;
+  string username = 7;
+  string endpoint_kind = 8;
+  repeated string ssh_args = 9;
+  string message = 10;
+}
