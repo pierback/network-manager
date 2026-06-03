@@ -748,15 +748,17 @@ impl SqliteStore {
                      VALUES (?1, ?2, 'hostname', ?3, 0.65, 'mdns')",
                     params![identity_id, discovered_id, hostname.as_str()],
                 )?;
-                self.upsert_endpoint(
-                    &identity_id,
-                    "mdns",
-                    &hostname,
-                    observation.port,
-                    Some(&hostname),
-                    "mdns",
-                    "online",
-                )?;
+                if observation.service_type == "_ssh._tcp" {
+                    self.upsert_endpoint(
+                        &identity_id,
+                        "mdns",
+                        &hostname,
+                        observation.port,
+                        Some(&hostname),
+                        "mdns",
+                        "online",
+                    )?;
+                }
             }
         }
 
@@ -1238,13 +1240,19 @@ impl SqliteStore {
     }
 
     fn identity_id_for_existing_stable_key(&self, stable_key: &str) -> Result<Option<String>> {
-        match self.find_identity_id(stable_key)? {
-            IdentityLookup::Found(identity_id) => Ok(Some(identity_id)),
-            IdentityLookup::NotFound => Ok(None),
-            IdentityLookup::Ambiguous(ids) => {
-                bail!("stable key '{stable_key}' unexpectedly matched multiple identities: {ids:?}")
-            }
-        }
+        let identity_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM device_identities WHERE stable_key = ?1",
+                params![stable_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("looking up identity by stable key")?;
+        identity_id
+            .map(|identity_id| self.active_identity_id(&identity_id))
+            .transpose()
+            .map(Option::flatten)
     }
 
     fn discovered_id_for_existing_source(
@@ -1638,7 +1646,7 @@ impl SqliteStore {
         })
     }
 
-    fn metadata_value(&self, key: &str) -> Result<Option<String>> {
+    pub fn metadata_value(&self, key: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
                 "SELECT value FROM daemon_metadata WHERE key = ?1",

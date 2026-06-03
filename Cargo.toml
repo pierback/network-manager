@@ -18,7 +18,7 @@ authors = ["Network Manager contributors"]
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
-gpui = { version = "0.2.2", default-features = false }
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
 http = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.13"
@@ -26,7 +26,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "process", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "process", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
 tonic-build = "0.12"

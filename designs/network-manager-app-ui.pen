@@ -2255,7 +2255,8 @@
                           "fill": "$text-secondary",
                           "content": "Raspberry Pi",
                           "fontFamily": "Inter",
-                          "fontSize": 13
+                          "fontSize": 13,
+                          "fontWeight": "normal"
                         }
                       ]
                     },
@@ -2407,7 +2408,8 @@
                           "fill": "$text-secondary",
                           "content": "Guest Laptop",
                           "fontFamily": "Inter",
-                          "fontSize": 13
+                          "fontSize": 13,
+                          "fontWeight": "normal"
                         }
                       ]
                     },
@@ -2537,7 +2539,8 @@
                           "fill": "$text-secondary",
                           "content": "Roku Stick",
                           "fontFamily": "Inter",
-                          "fontSize": 13
+                          "fontSize": 13,
+                          "fontWeight": "normal"
                         }
                       ]
                     },
@@ -2678,7 +2681,8 @@
                           "fill": "$text-secondary",
                           "content": "Unknown Device",
                           "fontFamily": "Inter",
-                          "fontSize": 13
+                          "fontSize": 13,
+                          "fontWeight": "normal"
                         }
                       ]
                     },

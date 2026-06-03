@@ -83,6 +83,21 @@ impl MockRepository {
             },
         ]
     }
+
+    fn detail_device_list(&self) -> Vec<DeviceIdentityVm> {
+        self.tracked_rows()
+            .into_iter()
+            .map(|row| DeviceIdentityVm {
+                id: row.id,
+                label: row.label,
+                alias: row.alias,
+                category: row.category,
+                tracked_state: TrackedState::Tracked,
+                ssh_username: None,
+                endpoint_preference: EndpointPreference::Auto,
+            })
+            .collect()
+    }
 }
 
 impl NetworkManagerRepository for MockRepository {
@@ -110,7 +125,7 @@ impl NetworkManagerRepository for MockRepository {
 
     fn discovery(&self) -> DiscoveryVm {
         DiscoveryVm {
-            filters: vec!["All sources".into(), "Online".into(), "Untracked".into()],
+            filters: vec!["All sources".into(), "By type".into(), "Untracked".into()],
             possible_match: Some(
                 "MacBook-Pro.local and office-mbp.tailnet.ts.net share host evidence; auto-merged with high confidence."
                     .into(),
@@ -118,7 +133,10 @@ impl NetworkManagerRepository for MockRepository {
             rows: vec![
                 DiscoveryRowVm {
                     id: "office-mbp".into(),
+                    identity_id: Some("office-mbp".into()),
                     display_name: "Office MacBook".into(),
+                    hostname: "office-mbp.local".into(),
+                    ip_address: "192.168.1.10".into(),
                     source: "Merged identity".into(),
                     sources: vec!["LAN".into(), "mDNS".into(), "Tailscale".into()],
                     category: "Mac".into(),
@@ -128,7 +146,10 @@ impl NetworkManagerRepository for MockRepository {
                 },
                 DiscoveryRowVm {
                     id: "nas-main".into(),
+                    identity_id: Some("nas-main".into()),
                     display_name: "Synology NAS".into(),
+                    hostname: "nas.tailnet.ts.net".into(),
+                    ip_address: "100.88.2.12".into(),
                     source: "Tailscale".into(),
                     sources: vec!["Tailscale".into(), "DNS".into()],
                     category: "Storage".into(),
@@ -138,7 +159,10 @@ impl NetworkManagerRepository for MockRepository {
                 },
                 DiscoveryRowVm {
                     id: "router".into(),
+                    identity_id: Some("router".into()),
                     display_name: "Home Router".into(),
+                    hostname: "router.local".into(),
+                    ip_address: "192.168.1.1".into(),
                     source: "ARP".into(),
                     sources: vec!["LAN".into(), "ARP".into()],
                     category: "Router".into(),
@@ -148,7 +172,10 @@ impl NetworkManagerRepository for MockRepository {
                 },
                 DiscoveryRowVm {
                     id: "printer-hp".into(),
+                    identity_id: Some("printer-hp".into()),
                     display_name: "HP LaserJet".into(),
+                    hostname: "hp-laserjet.local".into(),
+                    ip_address: "192.168.1.42".into(),
                     source: "mDNS".into(),
                     sources: vec!["LAN".into(), "mDNS".into()],
                     category: "Printer".into(),
@@ -158,7 +185,10 @@ impl NetworkManagerRepository for MockRepository {
                 },
                 DiscoveryRowVm {
                     id: "guest-phone".into(),
+                    identity_id: None,
                     display_name: "Guest iPhone".into(),
+                    hostname: "—".into(),
+                    ip_address: "192.168.1.77".into(),
                     source: "ARP".into(),
                     sources: vec!["LAN".into()],
                     category: "Phone".into(),
@@ -170,17 +200,38 @@ impl NetworkManagerRepository for MockRepository {
         }
     }
 
-    fn selected_device_detail(&self) -> DeviceDetailVm {
+    fn selected_device_detail(&self, selected_identity_id: Option<&str>) -> DeviceDetailVm {
+        let device_list = self.detail_device_list();
+        if let Some(selected) = selected_identity_id
+            .filter(|identity_id| *identity_id != "nas-main")
+            .and_then(|identity_id| {
+                device_list
+                    .iter()
+                    .find(|device| device.id == identity_id)
+                    .cloned()
+            })
+        {
+            return DeviceDetailVm {
+                evidence: vec![format!("Mock identity: {}", selected.id)],
+                identity: selected,
+                device_list,
+                endpoints: Vec::new(),
+                preferred_target: None,
+            };
+        }
+
+        let identity = DeviceIdentityVm {
+            id: "nas-main".into(),
+            label: "Synology NAS".into(),
+            alias: "nas-main".into(),
+            category: "Storage".into(),
+            tracked_state: TrackedState::Tracked,
+            ssh_username: Some("admin".into()),
+            endpoint_preference: EndpointPreference::Auto,
+        };
         DeviceDetailVm {
-            identity: DeviceIdentityVm {
-                id: "nas-main".into(),
-                label: "Synology NAS".into(),
-                alias: "nas-main".into(),
-                category: "Storage".into(),
-                tracked_state: TrackedState::Tracked,
-                ssh_username: Some("admin".into()),
-                endpoint_preference: EndpointPreference::Auto,
-            },
+            identity,
+            device_list,
             preferred_target: Some(SshTargetVm {
                 destination: "admin@nas.tailnet.ts.net".into(),
                 reason: "Using Tailscale because LAN reachability is stale.".into(),
@@ -268,7 +319,8 @@ mod tests {
 
     #[test]
     fn detail_mock_preserves_endpoint_grouping() {
-        let detail = MockRepository::new().selected_device_detail();
+        let detail = MockRepository::new().selected_device_detail(None);
+        assert_eq!(detail.device_list.len(), 5);
         assert!(detail
             .endpoints
             .iter()

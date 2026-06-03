@@ -42,7 +42,10 @@ pub struct DiscoveryVm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryRowVm {
     pub id: String,
+    pub identity_id: Option<String>,
     pub display_name: String,
+    pub hostname: String,
+    pub ip_address: String,
     pub source: String,
     pub sources: Vec<String>,
     pub category: String,
@@ -54,6 +57,7 @@ pub struct DiscoveryRowVm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDetailVm {
     pub identity: DeviceIdentityVm,
+    pub device_list: Vec<DeviceIdentityVm>,
     pub endpoints: Vec<EndpointVm>,
     pub preferred_target: Option<SshTargetVm>,
     pub evidence: Vec<String>,

@@ -112,6 +112,8 @@ enum Command {
     Export(ExportArgs),
     /// Import portable user settings JSON.
     Import(ImportArgs),
+    /// Print SSH config Host entries for resolved tracked aliases.
+    SshConfig(SshConfigArgs),
     /// Exec into ssh for the resolved device.
     Ssh(SshArgs),
 }
@@ -150,6 +152,12 @@ struct DaemonPlistArgs {
     label: Option<String>,
     #[arg(long)]
     daemon_path: Option<PathBuf>,
+    /// Seconds between automatic daemon quick refreshes.
+    #[arg(long)]
+    refresh_interval_seconds: Option<u64>,
+    /// Disable daemon automatic refreshes in the generated plist.
+    #[arg(long)]
+    disable_auto_refresh: bool,
 }
 
 #[derive(Debug, Args)]
@@ -158,6 +166,12 @@ struct DaemonInstallArgs {
     label: Option<String>,
     #[arg(long)]
     daemon_path: Option<PathBuf>,
+    /// Seconds between automatic daemon quick refreshes.
+    #[arg(long)]
+    refresh_interval_seconds: Option<u64>,
+    /// Disable daemon automatic refreshes in the installed plist.
+    #[arg(long)]
+    disable_auto_refresh: bool,
     #[arg(long)]
     force: bool,
     #[arg(long)]
@@ -366,6 +380,19 @@ struct ImportArgs {
 }
 
 #[derive(Debug, Args)]
+struct SshConfigArgs {
+    /// Include untracked devices with aliases too.
+    #[arg(long)]
+    all: bool,
+    /// Output path. Omit or pass '-' to write to stdout.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Overwrite an existing output file.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
 struct SshArgs {
     device: String,
     #[arg(long, value_enum, default_value_t = CliPreference::Auto)]
@@ -518,6 +545,21 @@ struct WatchOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct SshConfigEntryOutput {
+    host: String,
+    hostname: String,
+    port: u16,
+    user: Option<String>,
+    identity_id: String,
+    endpoint_kind: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SshConfigOutput {
+    entries: Vec<SshConfigEntryOutput>,
+}
+
+#[derive(Debug, Serialize)]
 struct DaemonPlistOutput {
     label: String,
     daemon_path: String,
@@ -580,7 +622,13 @@ async fn run() -> Result<()> {
                         .clone()
                         .unwrap_or_else(default_daemon_binary_path),
                 )?;
-                let plist = launch_agent_plist(label, &daemon_path, &paths)?;
+                let plist = launch_agent_plist(
+                    label,
+                    &daemon_path,
+                    &paths,
+                    args.refresh_interval_seconds,
+                    args.disable_auto_refresh,
+                )?;
                 let output = DaemonPlistOutput {
                     label: label.to_string(),
                     daemon_path: daemon_path.display().to_string(),
@@ -602,7 +650,14 @@ async fn run() -> Result<()> {
                         .clone()
                         .unwrap_or_else(default_daemon_binary_path),
                 )?;
-                let plist_path = install_launch_agent(label, &daemon_path, &paths, args.force)?;
+                let plist_path = install_launch_agent(
+                    label,
+                    &daemon_path,
+                    &paths,
+                    args.refresh_interval_seconds,
+                    args.disable_auto_refresh,
+                    args.force,
+                )?;
                 let mut message = format!("installed {}", plist_path.display());
                 if args.load {
                     launchctl_bootstrap(label)?;
@@ -897,6 +952,15 @@ async fn run() -> Result<()> {
             let result = import_settings(&paths, args.path.as_deref(), args.dry_run)?;
             print_struct(&result, cli.json)?;
         }
+        Command::SshConfig(args) => {
+            ssh_config(
+                &paths,
+                args.all,
+                args.output.as_deref(),
+                args.force,
+                cli.json,
+            )?;
+        }
         Command::Ssh(args) => {
             let resolved = resolve(&cli, &paths, &args.device, args.preference.as_core()).await?;
             ensure_resolved(&resolved)?;
@@ -997,7 +1061,13 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn launch_agent_plist(label: &str, daemon_path: &Path, paths: &Paths) -> Result<String> {
+fn launch_agent_plist(
+    label: &str,
+    daemon_path: &Path,
+    paths: &Paths,
+    refresh_interval_seconds: Option<u64>,
+    disable_auto_refresh: bool,
+) -> Result<String> {
     validate_launch_agent_label(label)?;
     if !daemon_path.is_absolute() {
         return Err(anyhow!("daemon binary path must be absolute"));
@@ -1005,6 +1075,7 @@ fn launch_agent_plist(label: &str, daemon_path: &Path, paths: &Paths) -> Result<
     let logs = log_dir();
     let stdout = logs.join("daemon.log");
     let stderr = logs.join("daemon.err.log");
+    let refresh_args = launch_agent_refresh_args(refresh_interval_seconds, disable_auto_refresh);
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1012,6 +1083,11 @@ fn launch_agent_plist(label: &str, daemon_path: &Path, paths: &Paths) -> Result<
 <dict>
   <key>Label</key>
   <string>{label}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>ProgramArguments</key>
   <array>
     <string>{daemon}</string>
@@ -1019,7 +1095,7 @@ fn launch_agent_plist(label: &str, daemon_path: &Path, paths: &Paths) -> Result<
     <string>{db}</string>
     <string>--socket</string>
     <string>{socket}</string>
-  </array>
+{refresh_args}  </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -1035,15 +1111,33 @@ fn launch_agent_plist(label: &str, daemon_path: &Path, paths: &Paths) -> Result<
         daemon = xml_escape(&daemon_path.display().to_string()),
         db = xml_escape(&paths.db.display().to_string()),
         socket = xml_escape(&paths.socket.display().to_string()),
+        refresh_args = refresh_args,
         stdout = xml_escape(&stdout.display().to_string()),
         stderr = xml_escape(&stderr.display().to_string()),
     ))
+}
+
+fn launch_agent_refresh_args(
+    refresh_interval_seconds: Option<u64>,
+    disable_auto_refresh: bool,
+) -> String {
+    let mut output = String::new();
+    if let Some(seconds) = refresh_interval_seconds {
+        output.push_str("    <string>--refresh-interval-seconds</string>\n");
+        output.push_str(&format!("    <string>{seconds}</string>\n"));
+    }
+    if disable_auto_refresh {
+        output.push_str("    <string>--disable-auto-refresh</string>\n");
+    }
+    output
 }
 
 fn install_launch_agent(
     label: &str,
     daemon_path: &Path,
     paths: &Paths,
+    refresh_interval_seconds: Option<u64>,
+    disable_auto_refresh: bool,
     force: bool,
 ) -> Result<PathBuf> {
     validate_launch_agent_label(label)?;
@@ -1070,7 +1164,13 @@ fn install_launch_agent(
     if let Some(parent) = paths.socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let plist = launch_agent_plist(label, daemon_path, paths)?;
+    let plist = launch_agent_plist(
+        label,
+        daemon_path,
+        paths,
+        refresh_interval_seconds,
+        disable_auto_refresh,
+    )?;
     std::fs::write(&plist_path, plist)?;
     Ok(plist_path)
 }
@@ -1357,6 +1457,106 @@ fn import_settings(
     let document: UserSettingsExport = serde_json::from_str(&text)?;
     let store = open_store(&paths.db)?;
     store.import_user_settings(&document, dry_run)
+}
+
+fn ssh_config(
+    paths: &Paths,
+    include_all: bool,
+    output: Option<&Path>,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    let entries = ssh_config_entries(paths, include_all)?;
+    if json {
+        return print_struct(&SshConfigOutput { entries }, true);
+    }
+
+    let text = render_ssh_config(&entries);
+    match output.filter(|path| path.as_os_str() != "-") {
+        Some(path) => {
+            if path.exists() && !force {
+                return Err(anyhow!(
+                    "{} already exists; use --force to overwrite",
+                    path.display()
+                ));
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, text)?;
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+fn ssh_config_entries(paths: &Paths, include_all: bool) -> Result<Vec<SshConfigEntryOutput>> {
+    let store = open_store(&paths.db)?;
+    let mut entries = Vec::new();
+    for record in store.list_device_identities()? {
+        let identity = record.identity;
+        if !include_all && identity.tracked_state != TrackedState::Tracked {
+            continue;
+        }
+        let Some(alias) = identity.alias.as_deref().filter(|alias| !alias.is_empty()) else {
+            continue;
+        };
+        let endpoints = store.endpoints_for_identity(&identity.id)?;
+        let Some(target) = resolve_ssh_target(
+            &endpoints,
+            identity.endpoint_preference,
+            identity.ssh_username.as_deref(),
+            identity.ssh_port,
+        ) else {
+            continue;
+        };
+        validate_ssh_config_token("Host", alias)?;
+        validate_ssh_config_token("HostName", &target.host)?;
+        if let Some(username) = target.username.as_deref() {
+            validate_ssh_config_token("User", username)?;
+        }
+        entries.push(SshConfigEntryOutput {
+            host: alias.to_string(),
+            hostname: target.host,
+            port: target.port,
+            user: target.username,
+            identity_id: identity.id,
+            endpoint_kind: target.endpoint_kind.as_str().to_string(),
+        });
+    }
+    entries.sort_by(|left, right| left.host.cmp(&right.host));
+    Ok(entries)
+}
+
+fn validate_ssh_config_token(field: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_ascii_whitespace())
+    {
+        return Err(anyhow!(
+            "cannot render invalid SSH config {field} value: {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn render_ssh_config(entries: &[SshConfigEntryOutput]) -> String {
+    let mut text = String::new();
+    text.push_str("# Generated by network-manager ssh-config. Review before including.\n");
+    for entry in entries {
+        text.push_str(&format!("\nHost {}\n", entry.host));
+        text.push_str(&format!("  HostName {}\n", entry.hostname));
+        text.push_str(&format!("  Port {}\n", entry.port));
+        if let Some(user) = entry.user.as_deref().filter(|user| !user.is_empty()) {
+            text.push_str(&format!("  User {user}\n"));
+        }
+        text.push_str(&format!(
+            "  # network-manager identity={} endpoint_kind={}\n",
+            entry.identity_id, entry.endpoint_kind
+        ));
+    }
+    text
 }
 
 async fn list_devices(

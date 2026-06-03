@@ -10,7 +10,9 @@ anyhow.workspace = true
 gpui.workspace = true
 network-manager-core = { path = "../core" }
 network-manager-db = { path = "../db" }
+network-manager-ipc = { path = "../ipc" }
 serde.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

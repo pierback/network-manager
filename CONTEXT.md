@@ -145,6 +145,7 @@ _Avoid_: Rename, label
 - **Last Seen** can apply to a **Device Identity** or **Network Endpoint**.
 - **Portable User Settings** apply to matching discovered identities; importing them must not create manual devices that were never discovered.
 - The user daemon exposes typed local IPC for reads, SSH resolution, refresh requests, and user-intent mutations.
+- The user daemon performs automatic bounded quick refreshes so discovery and endpoint status can stay warm without the UI or CLI polling manually.
 
 ## Example dialogue
 

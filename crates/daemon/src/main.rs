@@ -28,6 +28,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpStream, UnixListener};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
 
@@ -44,11 +45,24 @@ struct Args {
     /// Unix domain socket path for local IPC.
     #[arg(long, env = "NETWORK_MANAGER_SOCKET")]
     socket: Option<PathBuf>,
+
+    /// Seconds between automatic quick refreshes; 0 disables automatic refresh.
+    #[arg(
+        long,
+        env = "NETWORK_MANAGER_REFRESH_INTERVAL_SECONDS",
+        default_value_t = 60
+    )]
+    refresh_interval_seconds: u64,
+
+    /// Disable automatic background quick refreshes.
+    #[arg(long, env = "NETWORK_MANAGER_DISABLE_AUTO_REFRESH")]
+    disable_auto_refresh: bool,
 }
 
 #[derive(Clone)]
 struct DaemonService {
     store: Arc<Mutex<SqliteStore>>,
+    refresh_lock: Arc<AsyncMutex<()>>,
 }
 
 #[tonic::async_trait]
@@ -73,6 +87,7 @@ impl NetworkManager for DaemonService {
         &self,
         request: Request<RefreshRequest>,
     ) -> std::result::Result<Response<RefreshResponse>, Status> {
+        let _refresh_guard = self.refresh_lock.lock().await;
         let request = request.into_inner();
         let mode = if request.mode.is_empty() {
             "quick".to_string()
@@ -86,10 +101,11 @@ impl NetworkManager for DaemonService {
         } else {
             None
         };
-        let mdns_result = refresh_mdns_ssh().await;
+        let mdns_result = refresh_mdns_services().await;
         let lan_result = refresh_lan_arp().await;
 
         let mut accepted = false;
+        let mut targeted_lookup_failed = false;
         let mut messages = Vec::new();
         let mut active_lan_ips = Vec::new();
 
@@ -132,7 +148,7 @@ impl NetworkManager for DaemonService {
                         .record_mdns_services(&observations)
                         .map_err(internal_error)?;
                     accepted = true;
-                    messages.push(format!("recorded {count} mDNS SSH service(s)"));
+                    messages.push(format!("recorded {count} mDNS service(s)"));
                 }
                 Err(error) => messages.push(format!("mDNS unavailable: {error}")),
             }
@@ -190,12 +206,14 @@ impl NetworkManager for DaemonService {
                         endpoints
                     }
                     IdentityLookup::NotFound => {
+                        targeted_lookup_failed = true;
                         messages.push(format!(
                             "device '{requested_device}' was not found for targeted refresh"
                         ));
                         Vec::new()
                     }
                     IdentityLookup::Ambiguous(ids) => {
+                        targeted_lookup_failed = true;
                         messages.push(format!(
                             "device query '{requested_device}' is ambiguous: {}",
                             ids.join(", ")
@@ -219,6 +237,10 @@ impl NetworkManager for DaemonService {
                     .map_err(internal_error)?;
             }
             messages.push(format!("probed {} SSH endpoint(s)", probe_results.len()));
+        }
+
+        if targeted_lookup_failed {
+            accepted = false;
         }
 
         Ok(Response::new(RefreshResponse {
@@ -944,52 +966,94 @@ struct MdnsBrowseService {
     raw_line: String,
 }
 
-async fn refresh_mdns_ssh() -> Result<Vec<MdnsServiceObservation>> {
-    let browse_output = capture_dns_sd(
-        &[
-            "-B".to_string(),
-            "_ssh._tcp".to_string(),
-            "local.".to_string(),
-        ],
-        Duration::from_secs(2),
-    )
-    .await?;
-    let services = parse_dns_sd_browse(&browse_output);
+async fn refresh_mdns_services() -> Result<Vec<MdnsServiceObservation>> {
+    let service_types = [
+        "_ssh._tcp",
+        "_device-info._tcp",
+        "_workstation._tcp",
+        "_smb._tcp",
+        "_ipp._tcp",
+        "_ipps._tcp",
+        "_printer._tcp",
+        "_http._tcp",
+    ];
+
+    let browse_handles = service_types
+        .iter()
+        .map(|service_type| {
+            let args = vec![
+                "-B".to_string(),
+                (*service_type).to_string(),
+                "local.".to_string(),
+            ];
+            tokio::spawn(async move { capture_dns_sd(&args, Duration::from_millis(900)).await })
+        })
+        .collect::<Vec<_>>();
+
+    let mut services = Vec::new();
+    for handle in browse_handles {
+        if let Ok(Ok(output)) = handle.await {
+            services.extend(parse_dns_sd_browse(&output));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    services.retain(|service| {
+        seen.insert(format!(
+            "{}:{}:{}",
+            service.domain, service.service_type, service.service_name
+        ))
+    });
+
     let mut observations = Vec::new();
+    for chunk in services.chunks(12).take(3) {
+        let resolve_handles = chunk
+            .iter()
+            .map(|service| {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let resolve_output = capture_dns_sd(
+                        &[
+                            "-L".to_string(),
+                            service.service_name.clone(),
+                            service.service_type.clone(),
+                            format!("{}.", service.domain),
+                        ],
+                        Duration::from_millis(900),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    (service, resolve_output)
+                })
+            })
+            .collect::<Vec<_>>();
 
-    for service in services.into_iter().take(16) {
-        let resolve_output = capture_dns_sd(
-            &[
-                "-L".to_string(),
-                service.service_name.clone(),
-                service.service_type.clone(),
-                format!("{}.", service.domain),
-            ],
-            Duration::from_millis(1500),
-        )
-        .await
-        .unwrap_or_default();
-        let (hostname, port) = parse_dns_sd_resolve(&resolve_output)
-            .map(|(hostname, port)| (Some(hostname), Some(port)))
-            .unwrap_or((None, None));
-        let raw_text = if resolve_output.trim().is_empty() {
-            service.raw_line.clone()
-        } else {
-            format!("{}\n{}", service.raw_line, resolve_output.trim())
-        };
+        for handle in resolve_handles {
+            let Ok((service, resolve_output)) = handle.await else {
+                continue;
+            };
+            let (hostname, port) = parse_dns_sd_resolve(&resolve_output)
+                .map(|(hostname, port)| (Some(hostname), Some(port)))
+                .unwrap_or((None, None));
+            let raw_text = if resolve_output.trim().is_empty() {
+                service.raw_line.clone()
+            } else {
+                format!("{}\n{}", service.raw_line, resolve_output.trim())
+            };
 
-        observations.push(MdnsServiceObservation {
-            source_device_id: format!(
-                "{}:{}:{}",
-                service.domain, service.service_type, service.service_name
-            ),
-            service_name: service.service_name,
-            service_type: service.service_type,
-            domain: service.domain,
-            hostname,
-            port,
-            raw_text,
-        });
+            observations.push(MdnsServiceObservation {
+                source_device_id: format!(
+                    "{}:{}:{}",
+                    service.domain, service.service_type, service.service_name
+                ),
+                service_name: service.service_name,
+                service_type: service.service_type,
+                domain: service.domain,
+                hostname,
+                port,
+                raw_text,
+            });
+        }
     }
 
     Ok(observations)
@@ -1038,9 +1102,6 @@ fn parse_dns_sd_browse(output: &str) -> Vec<MdnsBrowseService> {
         }
         let domain = trim_dns_sd_field(parts[action_index + 3]);
         let service_type = trim_dns_sd_field(parts[action_index + 4]);
-        if service_type != "_ssh._tcp" {
-            continue;
-        }
         let service_name = parts[action_index + 5..].join(" ");
         if service_name.is_empty() {
             continue;
@@ -1159,7 +1220,55 @@ async fn refresh_lan_arp() -> Result<Vec<LanDeviceObservation>> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text.lines().filter_map(parse_arp_line).collect())
+    let mut observations = text.lines().filter_map(parse_arp_line).collect::<Vec<_>>();
+    resolve_lan_hostnames(&mut observations).await;
+    Ok(observations)
+}
+
+async fn resolve_lan_hostnames(observations: &mut [LanDeviceObservation]) {
+    let handles = observations
+        .iter()
+        .enumerate()
+        .filter(|(_, observation)| observation.hostname.is_none())
+        .map(|(index, observation)| {
+            let ip_address = observation.ip_address.clone();
+            tokio::spawn(async move { (index, reverse_dns_lookup(&ip_address).await) })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let Ok((index, Some(hostname))) = handle.await else {
+            continue;
+        };
+        if let Some(observation) = observations.get_mut(index) {
+            observation.hostname = Some(hostname);
+        }
+    }
+}
+
+async fn reverse_dns_lookup(ip_address: &str) -> Option<String> {
+    let output = tokio::time::timeout(
+        Duration::from_millis(700),
+        tokio::process::Command::new("dscacheutil")
+            .args(["-q", "host", "-a", "ip_address", ip_address])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_dscacheutil_hostname(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_dscacheutil_hostname(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "name")
+            .then(|| value.trim().trim_end_matches('.').to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn parse_arp_line(line: &str) -> Option<LanDeviceObservation> {
@@ -1234,12 +1343,42 @@ fn is_multicast_or_broadcast(ip: &str) -> bool {
 
 fn is_multicast_mac(mac: &str) -> bool {
     let normalized = mac.to_ascii_lowercase().replace('-', ":");
-    normalized.starts_with("01:00:5e") || normalized.starts_with("33:33")
+    normalized == "ff:ff:ff:ff:ff:ff"
+        || normalized.starts_with("01:00:5e")
+        || normalized.starts_with("33:33")
+}
+
+fn spawn_auto_refresh(socket_path: PathBuf, interval: Duration) {
+    tokio::spawn(async move {
+        let initial_delay = interval.min(Duration::from_secs(5));
+        tokio::time::sleep(initial_delay).await;
+
+        loop {
+            match network_manager_ipc::connect_uds(&socket_path).await {
+                Ok(mut client) => match client
+                    .refresh(RefreshRequest {
+                        mode: "quick".to_string(),
+                        device_query: String::new(),
+                    })
+                    .await
+                {
+                    Ok(response) => {
+                        println!("auto refresh: {}", response.into_inner().message);
+                    }
+                    Err(error) => eprintln!("auto refresh failed: {error:#}"),
+                },
+                Err(error) => eprintln!("auto refresh could not connect to daemon: {error:#}"),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let refresh_interval_seconds = args.refresh_interval_seconds;
+    let disable_auto_refresh = args.disable_auto_refresh;
     let db_path = args.db.unwrap_or_else(network_manager_db::default_db_path);
     let socket_path = args
         .socket
@@ -1248,6 +1387,18 @@ async fn main() -> Result<()> {
     let store = SqliteStore::open(&db_path)?;
     store.migrate()?;
     store.set_daemon_started()?;
+    store.set_metadata(
+        "auto_refresh_enabled",
+        if disable_auto_refresh || refresh_interval_seconds == 0 {
+            "false"
+        } else {
+            "true"
+        },
+    )?;
+    store.set_metadata(
+        "auto_refresh_interval_seconds",
+        &refresh_interval_seconds.to_string(),
+    )?;
 
     if let Some(parent) = network_manager_ipc::socket_parent(&socket_path) {
         std::fs::create_dir_all(parent)
@@ -1264,7 +1415,15 @@ async fn main() -> Result<()> {
 
     let service = DaemonService {
         store: Arc::new(Mutex::new(store)),
+        refresh_lock: Arc::new(AsyncMutex::new(())),
     };
+
+    if !disable_auto_refresh && refresh_interval_seconds > 0 {
+        spawn_auto_refresh(
+            socket_path.clone(),
+            Duration::from_secs(refresh_interval_seconds),
+        );
+    }
 
     println!(
         "network-manager-daemon listening on {}",
@@ -1315,6 +1474,14 @@ mod tests {
         assert_eq!(services[0].domain, "local");
         assert_eq!(services[0].service_type, "_ssh._tcp");
         assert_eq!(services[0].service_name, "Office MacBook Pro");
+    }
+
+    #[test]
+    fn parses_dscacheutil_reverse_hostname() {
+        assert_eq!(
+            parse_dscacheutil_hostname("name: office-macbook.local\nip_address: 192.168.1.20"),
+            Some("office-macbook.local".to_string())
+        );
     }
 
     #[test]

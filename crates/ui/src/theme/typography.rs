@@ -19,7 +19,5 @@ pub fn label(div: Div, tokens: LiquidGlassTokens) -> Div {
 }
 
 pub fn mono(div: Div, tokens: LiquidGlassTokens) -> Div {
-    div.font_family("SF Mono")
-        .text_xs()
-        .text_color(tokens.colors.text_secondary)
+    div.text_xs().text_color(tokens.colors.text_secondary)
 }
