@@ -1,14 +1,23 @@
 use std::sync::Arc;
 
-use gpui::{prelude::*, Context, Render, Window};
+use gpui::{
+    prelude::*, px, size, AppContext, Bounds, ClipboardItem, Context, FocusHandle, Render, Window,
+    WindowBounds, WindowOptions,
+};
 use network_manager_core::TrackedState;
 
 use crate::data::{
     ActionOutcome, DaemonActions, DaemonLifecycleAction, MockRepository, NetworkManagerActions,
     NetworkManagerRepository, NoopActions, RefreshMode, SqliteRepository,
 };
-use crate::layout::app_shell::{app_body, content_frame, sidebar, window_shell};
-use crate::routes::Route;
+use crate::hotkeys::{
+    ActualSize, BringAllToFront, CloseWindow, Find, FindNext, FindPrevious, MinimizeWindow,
+    NewWindow, NextRoute, Open, PreviousRoute, Print, RefreshFull, RefreshQuick, Save, SaveAs,
+    ShowDashboard, ShowDeviceDetail, ShowDiscovery, ShowKeyboardShortcuts, ShowQuickAccess,
+    ShowSettings, ToggleFullscreen, ToggleSidebar, ZoomIn, ZoomOut, ZoomWindow, KEY_CONTEXT,
+};
+use crate::layout::app_shell::window_shell;
+use crate::routes::{DiscoveryFilter, Route, SettingsSection};
 use crate::screens::{dashboard, device_detail, discovery, quick_access, settings};
 use crate::theme::LiquidGlassTokens;
 
@@ -24,10 +33,13 @@ pub struct NetworkManagerApp {
     repository: Box<dyn NetworkManagerRepository>,
     actions: Arc<dyn NetworkManagerActions>,
     selected_device_id: Option<String>,
+    selected_discovery_filter: DiscoveryFilter,
+    selected_settings_section: SettingsSection,
     startup_backend_checked: bool,
     action_status: Option<ActionStatus>,
     action_sequence: u64,
     tokens: LiquidGlassTokens,
+    focus_handle: Option<FocusHandle>,
 }
 
 impl NetworkManagerApp {
@@ -44,10 +56,13 @@ impl NetworkManagerApp {
             repository: Box::new(repository),
             actions: Arc::new(actions),
             selected_device_id: None,
+            selected_discovery_filter: DiscoveryFilter::AllSources,
+            selected_settings_section: SettingsSection::Discovery,
             startup_backend_checked: false,
             action_status: None,
             action_sequence: 0,
             tokens: LiquidGlassTokens::v4(),
+            focus_handle: None,
         }
     }
 
@@ -78,12 +93,37 @@ impl NetworkManagerApp {
         cx.notify();
     }
 
+    pub(crate) fn select_discovery_filter(
+        &mut self,
+        filter: DiscoveryFilter,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_discovery_filter = filter;
+        self.route = Route::Discovery;
+        cx.notify();
+    }
+
+    pub(crate) fn select_settings_section(
+        &mut self,
+        section: SettingsSection,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_settings_section = section;
+        self.route = Route::Settings;
+        cx.notify();
+    }
+
     pub fn select_route_for_test(&mut self, route: Route) {
         self.route = route;
     }
 
     pub fn refresh_for_test(&mut self, mode: RefreshMode) {
         self.refresh_inner(mode);
+    }
+
+    pub fn daemon_lifecycle_for_test(&mut self, action: DaemonLifecycleAction) {
+        let result = self.actions.daemon_lifecycle(action);
+        self.record_action_result(result);
     }
 
     pub fn track_discovery_identity_for_test(&mut self, identity_id: Option<String>) {
@@ -102,10 +142,12 @@ impl NetworkManagerApp {
         self.start_refresh(RefreshMode::Quick, cx);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn refresh_full(&mut self, cx: &mut Context<Self>) {
         self.start_refresh(RefreshMode::Full, cx);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_discovery_identity_state(
         &mut self,
         identity_id: Option<String>,
@@ -198,6 +240,33 @@ impl NetworkManagerApp {
             cx,
             move |actions| actions.refresh(mode),
         );
+    }
+
+    fn open_new_window(&mut self, cx: &mut Context<Self>) {
+        let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
+        let options = WindowOptions {
+            titlebar: None,
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(640.0), px(480.0))),
+            ..Default::default()
+        };
+        if let Err(error) = cx.open_window(options, |_, cx| cx.new(|_| NetworkManagerApp::live())) {
+            self.action_status = Some(ActionStatus {
+                message: format!("Could not open a new window: {error}"),
+                is_error: true,
+                is_pending: false,
+            });
+            cx.notify();
+        }
+    }
+
+    fn record_standard_action(&mut self, action: &str, cx: &mut Context<Self>) {
+        self.action_status = Some(ActionStatus {
+            message: format!("{action} has no editable document state in Network Manager yet."),
+            is_error: false,
+            is_pending: false,
+        });
+        cx.notify();
     }
 
     fn start_action(
@@ -309,6 +378,97 @@ impl NetworkManagerApp {
             },
         });
     }
+
+    fn previous_route(&mut self, cx: &mut Context<Self>) {
+        let index = Route::ALL
+            .iter()
+            .position(|route| *route == self.route)
+            .unwrap_or(0);
+        let previous = if index == 0 {
+            Route::ALL[Route::ALL.len() - 1]
+        } else {
+            Route::ALL[index - 1]
+        };
+        self.set_route(previous, cx);
+    }
+
+    fn next_route(&mut self, cx: &mut Context<Self>) {
+        let index = Route::ALL
+            .iter()
+            .position(|route| *route == self.route)
+            .unwrap_or(0);
+        let next = Route::ALL[(index + 1) % Route::ALL.len()];
+        self.set_route(next, cx);
+    }
+
+    pub(crate) fn show_keyboard_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.action_status = Some(ActionStatus {
+            message: "⌘1 Dashboard · ⌘2 Discovery · ⌘3 Detail · ⌘4 Quick Access · ⌘, Settings · ⌘R Refresh · ⇧⌘R Full Refresh · ⌘[/⌘] Previous/Next · ⌘K Quick Access · ⌘/ Shortcuts".into(),
+            is_error: false,
+            is_pending: false,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn copy_selected_ssh_command(&mut self, cx: &mut Context<Self>) {
+        let detail = self
+            .repository
+            .selected_device_detail(self.selected_device_id.as_deref());
+        let Some(target) = detail.preferred_target else {
+            self.record_detail_copy_error(
+                "No SSH target is available for the selected device.",
+                cx,
+            );
+            return;
+        };
+        let command = format!("ssh {}", target.destination);
+        cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+        self.record_info_message(format!("Copied {command}"), cx);
+    }
+
+    pub(crate) fn copy_selected_target(&mut self, cx: &mut Context<Self>) {
+        let detail = self
+            .repository
+            .selected_device_detail(self.selected_device_id.as_deref());
+        let Some(target) = detail.preferred_target else {
+            self.record_detail_copy_error("No target is available for the selected device.", cx);
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(target.destination.clone()));
+        self.record_info_message(format!("Copied {}", target.destination), cx);
+    }
+
+    fn record_detail_copy_error(&mut self, message: &'static str, cx: &mut Context<Self>) {
+        self.action_status = Some(ActionStatus {
+            message: message.into(),
+            is_error: true,
+            is_pending: false,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn record_info_message(
+        &mut self,
+        message: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.action_status = Some(ActionStatus {
+            message: message.into(),
+            is_error: false,
+            is_pending: false,
+        });
+        cx.notify();
+    }
+
+    fn ensure_focus_handle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> FocusHandle {
+        if let Some(handle) = &self.focus_handle {
+            return handle.clone();
+        }
+        let handle = cx.focus_handle();
+        handle.focus(window);
+        self.focus_handle = Some(handle.clone());
+        handle
+    }
 }
 
 impl Render for NetworkManagerApp {
@@ -333,21 +493,94 @@ impl Render for NetworkManagerApp {
             Route::Dashboard => {
                 dashboard::screen(&dashboard_vm, action_status.as_ref(), tokens, cx)
             }
-            Route::Discovery => {
-                discovery::screen(&discovery_vm, action_status.as_ref(), tokens, cx)
-            }
+            Route::Discovery => discovery::screen(
+                &discovery_vm,
+                self.selected_discovery_filter,
+                action_status.as_ref(),
+                tokens,
+                cx,
+            ),
             Route::DeviceDetail => {
                 device_detail::screen(&detail_vm, action_status.as_ref(), tokens, cx)
             }
             Route::QuickAccess => {
                 quick_access::screen(&quick_vm, action_status.as_ref(), tokens, cx)
             }
-            Route::Settings => settings::screen(&settings_vm, action_status.as_ref(), tokens, cx),
+            Route::Settings => settings::screen(
+                &settings_vm,
+                self.selected_settings_section,
+                action_status.as_ref(),
+                tokens,
+                cx,
+            ),
         };
+        let focus_handle = self.ensure_focus_handle(window, cx);
 
-        let nav = sidebar(route, tokens, cx);
+        Self::root_shell(content, tokens, &focus_handle, cx)
+    }
+}
 
-        window_shell(app_body(nav, content_frame(content)), tokens)
+impl NetworkManagerApp {
+    fn root_shell(
+        content: impl IntoElement,
+        tokens: LiquidGlassTokens,
+        focus_handle: &FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        window_shell(content, tokens)
+            .id("network-manager-root")
+            .overflow_scroll()
+            .key_context(KEY_CONTEXT)
+            .track_focus(focus_handle)
+            .on_action(
+                cx.listener(|app, _: &ShowDashboard, _, cx| app.set_route(Route::Dashboard, cx)),
+            )
+            .on_action(
+                cx.listener(|app, _: &ShowDiscovery, _, cx| app.set_route(Route::Discovery, cx)),
+            )
+            .on_action(cx.listener(|app, _: &ShowDeviceDetail, _, cx| {
+                app.set_route(Route::DeviceDetail, cx)
+            }))
+            .on_action(
+                cx.listener(|app, _: &ShowQuickAccess, _, cx| {
+                    app.set_route(Route::QuickAccess, cx)
+                }),
+            )
+            .on_action(cx.listener(|app, _: &NewWindow, _, cx| app.open_new_window(cx)))
+            .on_action(cx.listener(|app, _: &Open, _, cx| app.set_route(Route::Discovery, cx)))
+            .on_action(cx.listener(|app, _: &Save, _, cx| app.record_standard_action("Save", cx)))
+            .on_action(
+                cx.listener(|app, _: &SaveAs, _, cx| app.record_standard_action("Save As", cx)),
+            )
+            .on_action(cx.listener(|app, _: &Print, _, cx| app.record_standard_action("Print", cx)))
+            .on_action(cx.listener(|app, _: &Find, _, cx| app.set_route(Route::Discovery, cx)))
+            .on_action(cx.listener(|app, _: &FindNext, _, cx| app.set_route(Route::Discovery, cx)))
+            .on_action(
+                cx.listener(|app, _: &FindPrevious, _, cx| app.set_route(Route::Discovery, cx)),
+            )
+            .on_action(
+                cx.listener(|app, _: &ShowSettings, _, cx| app.set_route(Route::Settings, cx)),
+            )
+            .on_action(cx.listener(|app, _: &PreviousRoute, _, cx| app.previous_route(cx)))
+            .on_action(cx.listener(|app, _: &NextRoute, _, cx| app.next_route(cx)))
+            .on_action(cx.listener(|app, _: &RefreshQuick, _, cx| app.refresh_quick(cx)))
+            .on_action(cx.listener(|app, _: &RefreshFull, _, cx| app.refresh_full(cx)))
+            .on_action(cx.listener(|app, _: &ToggleSidebar, _, cx| {
+                app.record_standard_action("Toggle Sidebar", cx)
+            }))
+            .on_action(
+                cx.listener(|app, _: &ShowKeyboardShortcuts, _, cx| {
+                    app.show_keyboard_shortcuts(cx)
+                }),
+            )
+            .on_action(|_: &ZoomIn, window, _| window.zoom_window())
+            .on_action(|_: &ZoomOut, window, _| window.resize(size(px(1280.0), px(800.0))))
+            .on_action(|_: &ActualSize, window, _| window.resize(size(px(1280.0), px(800.0))))
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
+            .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
+            .on_action(|_: &ToggleFullscreen, window, _| window.toggle_fullscreen())
+            .on_action(|_: &BringAllToFront, window, _| window.activate_window())
     }
 }
 
@@ -496,6 +729,33 @@ mod tests {
         assert_eq!(
             app.action_status().map(|status| status.is_error),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn action_gateway_routes_daemon_lifecycle_actions() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let actions = RecordingActions {
+            calls: calls.clone(),
+            fail: false,
+        };
+        let mut app = NetworkManagerApp::new_with_actions(MockRepository::new(), actions);
+
+        app.daemon_lifecycle_for_test(DaemonLifecycleAction::InstallAndStart);
+        app.daemon_lifecycle_for_test(DaemonLifecycleAction::Start);
+        app.daemon_lifecycle_for_test(DaemonLifecycleAction::Stop);
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "daemon:install daemon",
+                "daemon:start daemon",
+                "daemon:stop daemon"
+            ]
+        );
+        assert_eq!(
+            app.action_status().map(|status| status.message.as_str()),
+            Some("daemon ok")
         );
     }
 

@@ -1,5 +1,6 @@
 use gpui::{div, prelude::*, Div, FontWeight};
 
+use crate::components::icons::{self, Icon};
 use crate::theme::LiquidGlassTokens;
 
 pub fn search_field(placeholder: &str, tokens: LiquidGlassTokens) -> Div {
@@ -13,7 +14,7 @@ pub fn search_field(placeholder: &str, tokens: LiquidGlassTokens) -> Div {
         .border_1()
         .border_color(tokens.colors.edge_soft)
         .bg(tokens.colors.panel)
-        .child(div().text_color(tokens.colors.text_muted).child("⌕"))
+        .child(icons::icon(Icon::Search, 14.0, tokens.colors.text_muted))
         .child(
             div()
                 .text_xs()

@@ -45,8 +45,9 @@ pub fn header(title: &str, subtitle: &str, tokens: LiquidGlassTokens) -> Div {
 
 pub fn system_note(title: &str, body: &str, tokens: LiquidGlassTokens) -> Div {
     panel(tokens)
-        .p_3()
-        .gap_1()
+        .px(px(12.0))
+        .py(px(10.0))
+        .gap(px(5.0))
         .flex()
         .flex_col()
         .child(
@@ -60,6 +61,7 @@ pub fn system_note(title: &str, body: &str, tokens: LiquidGlassTokens) -> Div {
             div()
                 .text_xs()
                 .text_color(tokens.colors.text_secondary)
+                .truncate()
                 .child(body.to_string()),
         )
 }

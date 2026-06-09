@@ -1,4 +1,62 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSection {
+    Discovery,
+    EndpointPreference,
+    IdentityCorrections,
+    CliAlias,
+    Notifications,
+}
+
+impl SettingsSection {
+    pub const ALL: [SettingsSection; 5] = [
+        SettingsSection::Discovery,
+        SettingsSection::EndpointPreference,
+        SettingsSection::IdentityCorrections,
+        SettingsSection::CliAlias,
+        SettingsSection::Notifications,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsSection::Discovery => "Discovery",
+            SettingsSection::EndpointPreference => "Endpoint Preference",
+            SettingsSection::IdentityCorrections => "Identity Corrections",
+            SettingsSection::CliAlias => "CLI Alias",
+            SettingsSection::Notifications => "Notifications",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryFilter {
+    AllSources,
+    Lan,
+    Tailscale,
+    SshCapable,
+    Untracked,
+}
+
+impl DiscoveryFilter {
+    pub const ALL: [DiscoveryFilter; 5] = [
+        DiscoveryFilter::AllSources,
+        DiscoveryFilter::Lan,
+        DiscoveryFilter::Tailscale,
+        DiscoveryFilter::SshCapable,
+        DiscoveryFilter::Untracked,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DiscoveryFilter::AllSources => "All sources",
+            DiscoveryFilter::Lan => "LAN",
+            DiscoveryFilter::Tailscale => "Tailscale",
+            DiscoveryFilter::SshCapable => "SSH capable",
+            DiscoveryFilter::Untracked => "Untracked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Dashboard,
     Discovery,
@@ -23,16 +81,6 @@ impl Route {
             Route::DeviceDetail => "Device Detail",
             Route::QuickAccess => "Quick Access",
             Route::Settings => "Settings",
-        }
-    }
-
-    pub fn symbol(self) -> &'static str {
-        match self {
-            Route::Dashboard => "◇",
-            Route::Discovery => "⌕",
-            Route::DeviceDetail => "◧",
-            Route::QuickAccess => "⌘",
-            Route::Settings => "⚙",
         }
     }
 }

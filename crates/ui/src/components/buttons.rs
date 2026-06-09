@@ -1,103 +1,160 @@
 use gpui::{div, prelude::*, px, Div, FontWeight};
 
+use crate::components::icons::{self, Icon};
 use crate::theme::LiquidGlassTokens;
 
 pub fn toolbar_button(label: &str, tokens: LiquidGlassTokens) -> Div {
+    toolbar_button_base(label, None, tokens)
+}
+
+pub fn toolbar_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) -> Div {
+    toolbar_button_base(label, Some(icon), tokens)
+}
+
+fn toolbar_button_base(label: &str, icon: Option<Icon>, tokens: LiquidGlassTokens) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(8.0))
+        .px(px(12.0))
+        .py(px(9.0))
+        .rounded(px(12.0))
+        .bg(gpui::rgba(0xffffff14))
+        .hover(|style| style.bg(tokens.colors.selected))
+        .cursor_pointer()
+        .font_family("Geist")
+        .text_size(px(12.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(tokens.colors.text)
+        .when_some(icon, |this, icon| {
+            this.child(icons::icon(icon, 14.0, tokens.colors.text_secondary))
+        })
+        .child(label.to_string())
+}
+
+pub fn icon_button(icon: Icon, tokens: LiquidGlassTokens) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(30.0))
+        .h(px(30.0))
+        .rounded(px(10.0))
+        .bg(gpui::rgba(0xffffff0a))
+        .hover(|style| style.bg(tokens.colors.selected))
+        .cursor_pointer()
+        .child(icons::icon(icon, 15.0, tokens.colors.text_secondary))
+}
+
+pub fn small_icon_button(icon: Icon, accent: bool, tokens: LiquidGlassTokens) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(28.0))
+        .rounded(px(10.0))
+        .bg(gpui::rgba(0xffffff0b))
+        .hover(|style| style.bg(tokens.colors.selected))
+        .cursor_pointer()
+        .child(icons::icon(
+            icon,
+            14.0,
+            if accent {
+                tokens.colors.icy
+            } else {
+                tokens.colors.text_secondary
+            },
+        ))
+}
+
+pub fn disabled_small_icon_button(icon: Icon, tokens: LiquidGlassTokens) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(28.0))
+        .h(px(28.0))
+        .rounded(px(10.0))
+        .bg(gpui::rgba(0xffffff08))
+        .child(icons::icon(icon, 14.0, tokens.colors.text_muted))
+}
+
+pub fn action_button(label: &str, tokens: LiquidGlassTokens) -> Div {
+    action_button_base(label, None, false, tokens)
+}
+
+pub fn action_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) -> Div {
+    action_button_base(label, Some(icon), false, tokens)
+}
+
+pub fn accent_button(label: &str, tokens: LiquidGlassTokens) -> Div {
+    action_button_base(label, None, true, tokens)
+}
+
+pub fn accent_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) -> Div {
+    action_button_base(label, Some(icon), true, tokens)
+}
+
+fn action_button_base(
+    label: &str,
+    icon: Option<Icon>,
+    accent: bool,
+    tokens: LiquidGlassTokens,
+) -> Div {
+    let fg = if accent {
+        tokens.colors.text
+    } else {
+        tokens.colors.text_secondary
+    };
     div()
         .flex()
         .items_center()
         .justify_center()
         .gap(px(6.0))
-        .px(px(12.0))
+        .px(px(9.0))
         .py(px(6.0))
-        .rounded(px(6.0))
-        .bg(tokens.colors.panel_strong)
-        .hover(|style| style.bg(tokens.colors.accent_hover))
-        .cursor_pointer()
-        .font_family("Inter")
-        .text_size(px(12.0))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(tokens.colors.text_secondary)
-        .child(label.to_string())
-}
-
-pub fn icon_button(symbol: &str, tokens: LiquidGlassTokens) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(32.0))
-        .h(px(32.0))
-        .rounded(px(6.0))
-        .bg(tokens.colors.panel_strong)
-        .hover(|style| style.bg(tokens.colors.selected))
-        .cursor_pointer()
-        .font_family("Inter")
-        .text_size(px(16.0))
-        .text_color(tokens.colors.text_secondary)
-        .child(symbol.to_string())
-}
-
-pub fn small_icon_button(symbol: &str, accent: bool, tokens: LiquidGlassTokens) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(26.0))
-        .h(px(26.0))
-        .rounded(px(5.0))
-        .bg(tokens.colors.panel_strong)
-        .hover(|style| style.bg(tokens.colors.selected))
-        .cursor_pointer()
-        .font_family("Inter")
-        .text_size(px(13.0))
-        .text_color(if accent {
-            tokens.colors.accent
+        .rounded(px(10.0))
+        .bg(if accent {
+            gpui::rgba(0xffffff18)
         } else {
-            tokens.colors.text_secondary
+            gpui::rgba(0xffffff0d)
         })
-        .child(symbol.to_string())
-}
-
-pub fn action_button(label: &str, tokens: LiquidGlassTokens) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .gap(px(4.0))
-        .px(px(10.0))
-        .py(px(4.0))
-        .rounded(px(4.0))
-        .bg(tokens.colors.panel_strong)
         .hover(|style| style.bg(tokens.colors.selected))
         .cursor_pointer()
-        .font_family("Inter")
-        .text_size(px(12.0))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(tokens.colors.text_muted)
+        .font_family("Geist")
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(fg)
+        .when_some(icon, |this, icon| this.child(icons::icon(icon, 13.0, fg)))
         .child(label.to_string())
-}
-
-pub fn accent_button(label: &str, tokens: LiquidGlassTokens) -> Div {
-    action_button(label, tokens)
-        .bg(tokens.colors.accent)
-        .text_color(tokens.colors.text_inverse)
-        .hover(|style| style.bg(tokens.colors.accent_hover))
 }
 
 pub fn disabled_button(label: &str, tokens: LiquidGlassTokens) -> Div {
+    disabled_button_base(label, None, tokens)
+}
+
+pub fn disabled_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) -> Div {
+    disabled_button_base(label, Some(icon), tokens)
+}
+
+fn disabled_button_base(label: &str, icon: Option<Icon>, tokens: LiquidGlassTokens) -> Div {
     div()
         .flex()
         .items_center()
         .justify_center()
-        .gap(px(4.0))
-        .px(px(10.0))
-        .py(px(4.0))
-        .rounded(px(4.0))
-        .bg(tokens.colors.panel)
-        .font_family("Inter")
-        .text_size(px(12.0))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(tokens.colors.text_muted)
+        .gap(px(6.0))
+        .px(px(9.0))
+        .py(px(6.0))
+        .rounded(px(10.0))
+        .bg(gpui::rgba(0xffffff0a))
+        .font_family("Geist")
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(tokens.colors.text_secondary)
+        .when_some(icon, |this, icon| {
+            this.child(icons::icon(icon, 13.0, tokens.colors.text_secondary))
+        })
         .child(label.to_string())
 }
