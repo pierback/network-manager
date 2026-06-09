@@ -93,6 +93,7 @@ impl MockRepository {
                 alias: row.alias,
                 category: row.category,
                 tracked_state: TrackedState::Tracked,
+                availability: row.overall,
                 ssh_username: None,
                 endpoint_preference: EndpointPreference::Auto,
             })
@@ -108,6 +109,7 @@ impl NetworkManagerRepository for MockRepository {
                 state: AvailabilityState::Online,
                 source: "mock daemon".into(),
                 tailscale_service: AvailabilityState::Online,
+                local_ip_address: "192.168.1.10".into(),
                 last_scan: "12s ago".into(),
                 stale: false,
             },
@@ -125,7 +127,13 @@ impl NetworkManagerRepository for MockRepository {
 
     fn discovery(&self) -> DiscoveryVm {
         DiscoveryVm {
-            filters: vec!["All sources".into(), "By type".into(), "Untracked".into()],
+            filters: vec![
+                "All sources".into(),
+                "LAN".into(),
+                "Tailscale".into(),
+                "SSH capable".into(),
+                "Untracked".into(),
+            ],
             possible_match: Some(
                 "MacBook-Pro.local and office-mbp.tailnet.ts.net share host evidence; auto-merged with high confidence."
                     .into(),
@@ -142,6 +150,7 @@ impl NetworkManagerRepository for MockRepository {
                     category: "Mac".into(),
                     tracked_state: TrackedState::Tracked,
                     availability: AvailabilityState::Online,
+                    ssh_capable: true,
                     last_seen: "30s ago".into(),
                 },
                 DiscoveryRowVm {
@@ -155,6 +164,7 @@ impl NetworkManagerRepository for MockRepository {
                     category: "Storage".into(),
                     tracked_state: TrackedState::Tracked,
                     availability: AvailabilityState::Online,
+                    ssh_capable: true,
                     last_seen: "1m ago".into(),
                 },
                 DiscoveryRowVm {
@@ -168,6 +178,7 @@ impl NetworkManagerRepository for MockRepository {
                     category: "Router".into(),
                     tracked_state: TrackedState::Untracked,
                     availability: AvailabilityState::Online,
+                    ssh_capable: false,
                     last_seen: "2m ago".into(),
                 },
                 DiscoveryRowVm {
@@ -181,6 +192,7 @@ impl NetworkManagerRepository for MockRepository {
                     category: "Printer".into(),
                     tracked_state: TrackedState::Tracked,
                     availability: AvailabilityState::Unknown,
+                    ssh_capable: false,
                     last_seen: "18m ago".into(),
                 },
                 DiscoveryRowVm {
@@ -194,6 +206,7 @@ impl NetworkManagerRepository for MockRepository {
                     category: "Phone".into(),
                     tracked_state: TrackedState::Untracked,
                     availability: AvailabilityState::Unknown,
+                    ssh_capable: false,
                     last_seen: "31m ago".into(),
                 },
             ],
@@ -226,6 +239,7 @@ impl NetworkManagerRepository for MockRepository {
             alias: "nas-main".into(),
             category: "Storage".into(),
             tracked_state: TrackedState::Tracked,
+            availability: AvailabilityState::Online,
             ssh_username: Some("admin".into()),
             endpoint_preference: EndpointPreference::Auto,
         };

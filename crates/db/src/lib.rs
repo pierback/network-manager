@@ -748,17 +748,19 @@ impl SqliteStore {
                      VALUES (?1, ?2, 'hostname', ?3, 0.65, 'mdns')",
                     params![identity_id, discovered_id, hostname.as_str()],
                 )?;
-                if observation.service_type == "_ssh._tcp" {
-                    self.upsert_endpoint(
-                        &identity_id,
-                        "mdns",
-                        &hostname,
-                        observation.port,
-                        Some(&hostname),
-                        "mdns",
-                        "online",
-                    )?;
-                }
+                self.upsert_endpoint(
+                    &identity_id,
+                    "mdns",
+                    &hostname,
+                    if observation.service_type == "_ssh._tcp" {
+                        observation.port
+                    } else {
+                        None
+                    },
+                    Some(&hostname),
+                    "mdns",
+                    "online",
+                )?;
             }
         }
 
@@ -2231,6 +2233,42 @@ mod tests {
         assert_eq!(endpoints[0].kind, EndpointKind::Mdns);
         assert_eq!(endpoints[0].hostname.as_deref(), Some("office-mac.local"));
         assert_eq!(endpoints[0].port, Some(22));
+    }
+
+    #[test]
+    fn records_non_ssh_mdns_services_as_online_device_endpoints() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+
+        store
+            .record_mdns_services(&[MdnsServiceObservation {
+                source_device_id: "local.:_workstation._tcp.:homeassistant".to_string(),
+                service_name: "homeassistant".to_string(),
+                service_type: "_workstation._tcp".to_string(),
+                domain: "local".to_string(),
+                hostname: Some("homeassistant.local".to_string()),
+                port: None,
+                raw_text:
+                    "homeassistant._workstation._tcp.local. can be reached at homeassistant.local."
+                        .to_string(),
+            }])
+            .unwrap();
+
+        let identities = store.list_device_identities().unwrap();
+        assert_eq!(identities.len(), 1);
+        let endpoints = store
+            .endpoints_for_identity(&identities[0].identity.id)
+            .unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].kind, EndpointKind::Mdns);
+        assert_eq!(
+            endpoints[0].hostname.as_deref(),
+            Some("homeassistant.local")
+        );
+        assert_eq!(endpoints[0].reachability, AvailabilityState::Online);
+        assert_eq!(endpoints[0].ssh_capability, AvailabilityState::Unknown);
     }
 
     #[test]

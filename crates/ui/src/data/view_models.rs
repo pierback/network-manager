@@ -5,6 +5,7 @@ pub struct DaemonStatusVm {
     pub state: AvailabilityState,
     pub source: String,
     pub tailscale_service: AvailabilityState,
+    pub local_ip_address: String,
     pub last_scan: String,
     pub stale: bool,
 }
@@ -51,6 +52,7 @@ pub struct DiscoveryRowVm {
     pub category: String,
     pub tracked_state: TrackedState,
     pub availability: AvailabilityState,
+    pub ssh_capable: bool,
     pub last_seen: String,
 }
 
@@ -70,6 +72,7 @@ pub struct DeviceIdentityVm {
     pub alias: String,
     pub category: String,
     pub tracked_state: TrackedState,
+    pub availability: AvailabilityState,
     pub ssh_username: Option<String>,
     pub endpoint_preference: EndpointPreference,
 }
