@@ -7,8 +7,8 @@ use gpui::{
 use network_manager_core::TrackedState;
 
 use crate::data::{
-    ActionOutcome, DaemonActions, DaemonLifecycleAction, MockRepository, NetworkManagerActions,
-    NetworkManagerRepository, NoopActions, RefreshMode, SqliteRepository,
+    ActionOutcome, ActionStatus, DaemonActions, DaemonLifecycleAction, MockRepository,
+    NetworkManagerActions, NetworkManagerRepository, NoopActions, RefreshMode, SqliteRepository,
 };
 use crate::hotkeys::{
     ActualSize, BringAllToFront, CloseWindow, Find, FindNext, FindPrevious, MinimizeWindow,
@@ -21,12 +21,7 @@ use crate::routes::{DiscoveryFilter, Route, SettingsSection};
 use crate::screens::{dashboard, device_detail, discovery, quick_access, settings};
 use crate::theme::LiquidGlassTokens;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActionStatus {
-    pub message: String,
-    pub is_error: bool,
-    pub is_pending: bool,
-}
+const ACTION_STATUS_SUMMARY_CHAR_LIMIT: usize = 110;
 
 pub struct NetworkManagerApp {
     route: Route,
@@ -126,6 +121,11 @@ impl NetworkManagerApp {
         self.record_action_result(result);
     }
 
+    pub fn open_diagnostics_folder_for_test(&mut self) {
+        let result = self.actions.open_diagnostics_folder();
+        self.record_action_result(result);
+    }
+
     pub fn track_discovery_identity_for_test(&mut self, identity_id: Option<String>) {
         self.set_discovery_identity_state_inner(identity_id, TrackedState::Tracked);
     }
@@ -162,6 +162,7 @@ impl NetworkManagerApp {
             self.action_status = Some(ActionStatus {
                 message: "Cannot update this discovery yet because it has no device identity."
                     .into(),
+                detail: None,
                 is_error: true,
                 is_pending: false,
             });
@@ -208,8 +209,18 @@ impl NetworkManagerApp {
         self.start_daemon_lifecycle(DaemonLifecycleAction::Start, cx);
     }
 
+    pub(crate) fn restart_daemon(&mut self, cx: &mut Context<Self>) {
+        self.start_daemon_lifecycle(DaemonLifecycleAction::Restart, cx);
+    }
+
     pub(crate) fn stop_daemon(&mut self, cx: &mut Context<Self>) {
         self.start_daemon_lifecycle(DaemonLifecycleAction::Stop, cx);
+    }
+
+    pub(crate) fn open_diagnostics_folder(&mut self, cx: &mut Context<Self>) {
+        self.start_action("Opening diagnostics folder…".into(), cx, move |actions| {
+            actions.open_diagnostics_folder()
+        });
     }
 
     fn start_daemon_lifecycle(&mut self, action: DaemonLifecycleAction, cx: &mut Context<Self>) {
@@ -227,9 +238,7 @@ impl NetworkManagerApp {
             move |actions| {
                 let backend = actions.ensure_backend()?;
                 let refresh = actions.refresh(RefreshMode::Quick)?;
-                Ok(ActionOutcome {
-                    message: format!("{}; {}", backend.message, refresh.message),
-                })
+                Ok(ActionOutcome::combine(backend, refresh))
             },
         );
     }
@@ -253,6 +262,7 @@ impl NetworkManagerApp {
         if let Err(error) = cx.open_window(options, |_, cx| cx.new(|_| NetworkManagerApp::live())) {
             self.action_status = Some(ActionStatus {
                 message: format!("Could not open a new window: {error}"),
+                detail: None,
                 is_error: true,
                 is_pending: false,
             });
@@ -263,6 +273,7 @@ impl NetworkManagerApp {
     fn record_standard_action(&mut self, action: &str, cx: &mut Context<Self>) {
         self.action_status = Some(ActionStatus {
             message: format!("{action} has no editable document state in Network Manager yet."),
+            detail: None,
             is_error: false,
             is_pending: false,
         });
@@ -282,6 +293,7 @@ impl NetworkManagerApp {
         }
         self.action_status = Some(ActionStatus {
             message: pending_message,
+            detail: None,
             is_error: false,
             is_pending: true,
         });
@@ -318,6 +330,7 @@ impl NetworkManagerApp {
             self.action_status = Some(ActionStatus {
                 message: "Cannot update this discovery yet because it has no device identity."
                     .into(),
+                detail: None,
                 is_error: true,
                 is_pending: false,
             });
@@ -335,6 +348,7 @@ impl NetworkManagerApp {
         {
             self.action_status = Some(ActionStatus {
                 message: "Another network action is already running; wait for it to finish.".into(),
+                detail: None,
                 is_error: false,
                 is_pending: true,
             });
@@ -366,16 +380,10 @@ impl NetworkManagerApp {
 
     fn record_action_result(&mut self, result: anyhow::Result<ActionOutcome>) {
         self.action_status = Some(match result {
-            Ok(outcome) => ActionStatus {
-                message: outcome.message,
-                is_error: false,
-                is_pending: false,
-            },
-            Err(error) => ActionStatus {
-                message: format!("{error:#}"),
-                is_error: true,
-                is_pending: false,
-            },
+            Ok(outcome) => action_status_from_outcome(outcome, false),
+            Err(error) => {
+                action_status_from_outcome(ActionOutcome::new(format!("{error:#}")), true)
+            }
         });
     }
 
@@ -404,6 +412,7 @@ impl NetworkManagerApp {
     pub(crate) fn show_keyboard_shortcuts(&mut self, cx: &mut Context<Self>) {
         self.action_status = Some(ActionStatus {
             message: "⌘1 Dashboard · ⌘2 Discovery · ⌘3 Detail · ⌘4 Quick Access · ⌘, Settings · ⌘R Refresh · ⇧⌘R Full Refresh · ⌘[/⌘] Previous/Next · ⌘K Quick Access · ⌘/ Shortcuts".into(),
+            detail: None,
             is_error: false,
             is_pending: false,
         });
@@ -441,6 +450,7 @@ impl NetworkManagerApp {
     fn record_detail_copy_error(&mut self, message: &'static str, cx: &mut Context<Self>) {
         self.action_status = Some(ActionStatus {
             message: message.into(),
+            detail: None,
             is_error: true,
             is_pending: false,
         });
@@ -454,6 +464,7 @@ impl NetworkManagerApp {
     ) {
         self.action_status = Some(ActionStatus {
             message: message.into(),
+            detail: None,
             is_error: false,
             is_pending: false,
         });
@@ -469,6 +480,85 @@ impl NetworkManagerApp {
         self.focus_handle = Some(handle.clone());
         handle
     }
+}
+
+fn action_status_from_outcome(outcome: ActionOutcome, is_error: bool) -> ActionStatus {
+    let raw_message = outcome.message.trim().to_string();
+    let message = action_status_message(&raw_message, is_error);
+    let detail = if message == raw_message || raw_message.is_empty() {
+        outcome.detail
+    } else {
+        outcome.detail.or(Some(raw_message))
+    };
+
+    ActionStatus {
+        message,
+        detail,
+        is_error,
+        is_pending: false,
+    }
+}
+
+fn action_status_message(raw_message: &str, is_error: bool) -> String {
+    if raw_message.is_empty() {
+        return if is_error {
+            "Network action failed. Open diagnostics for details.".into()
+        } else {
+            "Network action finished.".into()
+        };
+    }
+
+    if raw_message.contains("Tailscale unavailable")
+        || raw_message.contains("failed to connect to local Tailscale service")
+    {
+        return tailscale_unavailable_message(raw_message, is_error);
+    }
+
+    if raw_message.chars().count() <= ACTION_STATUS_SUMMARY_CHAR_LIMIT {
+        return raw_message.to_string();
+    }
+
+    raw_message
+        .split(['\n', ';'])
+        .next()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .map(|summary| trim_action_summary(summary, ACTION_STATUS_SUMMARY_CHAR_LIMIT))
+        .unwrap_or_else(|| {
+            if is_error {
+                "Network action failed. Open diagnostics for details.".into()
+            } else {
+                "Network action finished. Open diagnostics for details.".into()
+            }
+        })
+}
+
+fn tailscale_unavailable_message(raw_message: &str, is_error: bool) -> String {
+    if is_error {
+        return "Tailscale is unavailable. LAN discovery may still work.".into();
+    }
+
+    let sync_message = "Local sync finished. Tailscale is unavailable.";
+    if raw_message.contains("Local daemon started") {
+        return format!("Local daemon started. {sync_message}");
+    }
+    if raw_message.contains("Local daemon is already running") {
+        return format!("Local daemon is already running. {sync_message}");
+    }
+    sync_message.into()
+}
+
+fn trim_action_summary(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut summary = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    summary.push('…');
+    summary
 }
 
 impl Render for NetworkManagerApp {
@@ -612,9 +702,7 @@ mod tests {
             if self.fail {
                 anyhow::bail!("refresh failed");
             }
-            Ok(ActionOutcome {
-                message: "refresh ok".into(),
-            })
+            Ok(ActionOutcome::new("refresh ok"))
         }
 
         fn ensure_backend(&self) -> anyhow::Result<ActionOutcome> {
@@ -622,9 +710,7 @@ mod tests {
             if self.fail {
                 anyhow::bail!("backend failed");
             }
-            Ok(ActionOutcome {
-                message: "backend ok".into(),
-            })
+            Ok(ActionOutcome::new("backend ok"))
         }
 
         fn set_tracked_state(
@@ -639,9 +725,7 @@ mod tests {
             if self.fail {
                 anyhow::bail!("track failed");
             }
-            Ok(ActionOutcome {
-                message: "track ok".into(),
-            })
+            Ok(ActionOutcome::new("track ok"))
         }
 
         fn merge_identities(
@@ -656,9 +740,7 @@ mod tests {
             if self.fail {
                 anyhow::bail!("merge failed");
             }
-            Ok(ActionOutcome {
-                message: "merge ok".into(),
-            })
+            Ok(ActionOutcome::new("merge ok"))
         }
 
         fn split_discovered_device(
@@ -672,9 +754,7 @@ mod tests {
             if self.fail {
                 anyhow::bail!("split failed");
             }
-            Ok(ActionOutcome {
-                message: "split ok".into(),
-            })
+            Ok(ActionOutcome::new("split ok"))
         }
 
         fn daemon_lifecycle(&self, action: DaemonLifecycleAction) -> anyhow::Result<ActionOutcome> {
@@ -685,9 +765,15 @@ mod tests {
             if self.fail {
                 anyhow::bail!("daemon action failed");
             }
-            Ok(ActionOutcome {
-                message: "daemon ok".into(),
-            })
+            Ok(ActionOutcome::new("daemon ok"))
+        }
+
+        fn open_diagnostics_folder(&self) -> anyhow::Result<ActionOutcome> {
+            self.calls.lock().unwrap().push("open_diagnostics".into());
+            if self.fail {
+                anyhow::bail!("diagnostics failed");
+            }
+            Ok(ActionOutcome::new("diagnostics ok"))
         }
     }
 
@@ -743,6 +829,7 @@ mod tests {
 
         app.daemon_lifecycle_for_test(DaemonLifecycleAction::InstallAndStart);
         app.daemon_lifecycle_for_test(DaemonLifecycleAction::Start);
+        app.daemon_lifecycle_for_test(DaemonLifecycleAction::Restart);
         app.daemon_lifecycle_for_test(DaemonLifecycleAction::Stop);
 
         assert_eq!(
@@ -750,12 +837,31 @@ mod tests {
             [
                 "daemon:install daemon",
                 "daemon:start daemon",
+                "daemon:restart daemon",
                 "daemon:stop daemon"
             ]
         );
         assert_eq!(
             app.action_status().map(|status| status.message.as_str()),
             Some("daemon ok")
+        );
+    }
+
+    #[test]
+    fn action_gateway_routes_diagnostics_folder_action() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let actions = RecordingActions {
+            calls: calls.clone(),
+            fail: false,
+        };
+        let mut app = NetworkManagerApp::new_with_actions(MockRepository::new(), actions);
+
+        app.open_diagnostics_folder_for_test();
+
+        assert_eq!(calls.lock().unwrap().as_slice(), ["open_diagnostics"]);
+        assert_eq!(
+            app.action_status().map(|status| status.message.as_str()),
+            Some("diagnostics ok")
         );
     }
 
@@ -775,21 +881,80 @@ mod tests {
     }
 
     #[test]
+    fn action_gateway_preserves_action_outcome_detail() {
+        let raw = "started bundled daemon; quick refresh: Tailscale unavailable: tailscale status failed: failed to connect to local Tailscale service; is Tailscale running?; recorded 7 mDNS services".to_string();
+        let outcome = ActionOutcome::new(raw.clone());
+
+        let status = action_status_from_outcome(outcome, false);
+
+        assert_eq!(
+            status.message,
+            "Local sync finished. Tailscale is unavailable."
+        );
+        assert_eq!(status.detail.as_deref(), Some(raw.as_str()));
+        assert!(!status.is_error);
+    }
+
+    #[test]
+    fn action_gateway_keeps_backend_start_in_tailscale_summary() {
+        let raw = "quick refresh: Tailscale unavailable: tailscale status failed";
+        let outcome = ActionOutcome::combine(
+            ActionOutcome::new("Local daemon started."),
+            ActionOutcome::new(raw),
+        );
+
+        let status = action_status_from_outcome(outcome, false);
+
+        assert_eq!(
+            status.message,
+            "Local daemon started. Local sync finished. Tailscale is unavailable."
+        );
+        assert_eq!(
+            status.detail.as_deref(),
+            Some("Local daemon started. quick refresh: Tailscale unavailable: tailscale status failed")
+        );
+        assert!(!status.is_error);
+    }
+
+    #[test]
+    fn action_gateway_summarizes_tailscale_errors_as_recoverable() {
+        let raw =
+            "tailscale status failed: failed to connect to local Tailscale service; is Tailscale running?";
+
+        let status = action_status_from_outcome(ActionOutcome::new(raw), true);
+
+        assert_eq!(
+            status.message,
+            "Tailscale is unavailable. LAN discovery may still work."
+        );
+        assert_eq!(status.detail.as_deref(), Some(raw));
+        assert!(status.is_error);
+    }
+
+    #[test]
+    fn action_gateway_keeps_short_action_outcomes_without_detail() {
+        let status = action_status_from_outcome(ActionOutcome::new("refresh ok"), false);
+
+        assert_eq!(status.message, "refresh ok");
+        assert_eq!(status.detail, None);
+        assert!(!status.is_error);
+    }
+
+    #[test]
     fn stale_async_action_results_do_not_overwrite_current_status() {
         let mut app = NetworkManagerApp::mock();
         let stale_action = app.next_action_sequence();
         let current_action = app.next_action_sequence();
         app.action_status = Some(ActionStatus {
             message: "current action running".into(),
+            detail: None,
             is_error: false,
             is_pending: true,
         });
 
         app.record_action_result_if_current(
             stale_action,
-            Ok(ActionOutcome {
-                message: "stale action complete".into(),
-            }),
+            Ok(ActionOutcome::new("stale action complete")),
         );
         assert_eq!(
             app.action_status().map(|status| status.message.as_str()),
@@ -802,9 +967,7 @@ mod tests {
 
         app.record_action_result_if_current(
             current_action,
-            Ok(ActionOutcome {
-                message: "current action complete".into(),
-            }),
+            Ok(ActionOutcome::new("current action complete")),
         );
         assert_eq!(
             app.action_status().map(|status| status.message.as_str()),

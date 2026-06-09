@@ -142,6 +142,8 @@ enum DaemonCommand {
     Uninstall(DaemonLabelArgs),
     /// Start the installed LaunchAgent.
     Start(DaemonLabelArgs),
+    /// Restart the installed LaunchAgent.
+    Restart(DaemonLabelArgs),
     /// Stop the installed LaunchAgent.
     Stop(DaemonLabelArgs),
 }
@@ -689,6 +691,17 @@ async fn run() -> Result<()> {
                     cli.json,
                 )?;
             }
+            DaemonCommand::Restart(args) => {
+                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+                restart_launch_agent(label)?;
+                print_daemon_action(
+                    "restart",
+                    label,
+                    Some(&launch_agent_path(label)),
+                    &format!("restarted {label}"),
+                    cli.json,
+                )?;
+            }
             DaemonCommand::Stop(args) => {
                 let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
                 launchctl_bootout(label)?;
@@ -1195,6 +1208,20 @@ fn launchctl_bootout(label: &str) -> Result<()> {
     validate_launch_agent_label(label)?;
     let service = format!("{}/{}", gui_domain()?, label);
     run_launchctl(&["bootout".to_string(), service])
+}
+
+fn restart_launch_agent(label: &str) -> Result<()> {
+    match launchctl_bootout(label) {
+        Ok(()) => {}
+        Err(error) if launchctl_missing_process_error(&error) => {}
+        Err(error) => return Err(error).context("stopping LaunchAgent before restart"),
+    }
+    launchctl_bootstrap(label).context("starting LaunchAgent after restart")
+}
+
+fn launchctl_missing_process_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("No such process") || message.contains("service is not loaded")
 }
 
 fn run_launchctl(args: &[String]) -> Result<()> {
@@ -2623,4 +2650,38 @@ fn exec_ssh(base_args: &[String], extra_args: &[String]) -> Result<()> {
         .status()
         .context("running ssh")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_restart_command_parses() {
+        let cli = Cli::try_parse_from(["network-manager", "daemon", "restart"]).unwrap();
+
+        let Command::Daemon {
+            command: DaemonCommand::Restart(args),
+        } = cli.command
+        else {
+            panic!("expected daemon restart command");
+        };
+        assert_eq!(args.label, None);
+    }
+
+    #[test]
+    fn missing_launch_agent_process_is_restartable() {
+        let error = anyhow!(
+            "launchctl exited with status exit status: 3: Boot-out failed: 3: No such process"
+        );
+
+        assert!(launchctl_missing_process_error(&error));
+    }
+
+    #[test]
+    fn unrelated_launchctl_error_is_not_restartable() {
+        let error = anyhow!("launchctl exited with status exit status: 5: Input/output error");
+
+        assert!(!launchctl_missing_process_error(&error));
+    }
 }

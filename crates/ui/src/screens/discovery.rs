@@ -1,13 +1,13 @@
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, FontWeight, SharedString};
 use network_manager_core::TrackedState;
 
-use crate::app::{ActionStatus, NetworkManagerApp};
+use crate::app::NetworkManagerApp;
 use crate::components::{
     buttons,
     icons::{self, Icon},
     status,
 };
-use crate::data::{DiscoveryRowVm, DiscoveryVm};
+use crate::data::{ActionStatus, DiscoveryRowVm, DiscoveryVm};
 use crate::layout::app_shell::v4_route_shell;
 use crate::routes::{DiscoveryFilter, Route};
 use crate::theme::LiquidGlassTokens;
@@ -394,11 +394,30 @@ fn discovery_status_banner(status: &ActionStatus, tokens: LiquidGlassTokens) -> 
         .child(icons::icon(icon, 15.0, color))
         .child(
             div()
-                .font_family("Geist")
-                .text_size(px(13.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(tokens.colors.text_secondary)
-                .child(status.message.clone()),
+                .flex_1()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .font_family("Geist")
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tokens.colors.text_secondary)
+                        .truncate()
+                        .child(status.message.clone()),
+                )
+                .when(status.detail.is_some(), |this| {
+                    this.child(
+                        div()
+                            .font_family("Geist")
+                            .text_size(px(11.0))
+                            .text_color(tokens.colors.text_muted)
+                            .truncate()
+                            .child("Open Logs for daemon diagnostics."),
+                    )
+                }),
         )
 }
 

@@ -1,6 +1,14 @@
 use network_manager_core::{AvailabilityState, EndpointKind, EndpointPreference, TrackedState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionStatus {
+    pub message: String,
+    pub detail: Option<String>,
+    pub is_error: bool,
+    pub is_pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonStatusVm {
     pub state: AvailabilityState,
     pub source: String,
@@ -120,6 +128,7 @@ pub struct QuickAccessVm {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsVm {
+    pub daemon: DaemonStatusVm,
     pub discovery_interval: String,
     pub battery_mode: bool,
     pub tailscale_enabled: bool,

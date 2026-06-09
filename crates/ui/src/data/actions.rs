@@ -28,12 +28,51 @@ impl RefreshMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionOutcome {
     pub message: String,
+    pub detail: Option<String>,
+}
+
+impl ActionOutcome {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(message: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            detail: Some(detail.into()),
+        }
+    }
+
+    pub fn combine(first: Self, second: Self) -> Self {
+        let message = format!("{} {}", sentence(&first.message), second.message);
+        let detail = match (first.detail, second.detail) {
+            (Some(first_detail), Some(second_detail)) => {
+                Some(format!("{first_detail}\n{second_detail}"))
+            }
+            (Some(first_detail), None) => Some(first_detail),
+            (None, Some(second_detail)) => Some(second_detail),
+            (None, None) => None,
+        };
+        Self { message, detail }
+    }
+}
+
+fn sentence(value: &str) -> String {
+    if value.ends_with(['.', '!', '?']) {
+        value.to_string()
+    } else {
+        format!("{value}.")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonLifecycleAction {
     InstallAndStart,
     Start,
+    Restart,
     Stop,
 }
 
@@ -42,6 +81,7 @@ impl DaemonLifecycleAction {
         match self {
             Self::InstallAndStart => "install daemon",
             Self::Start => "start daemon",
+            Self::Restart => "restart daemon",
             Self::Stop => "stop daemon",
         }
     }
@@ -55,6 +95,7 @@ pub trait NetworkManagerActions: Send + Sync {
     fn merge_identities(&self, source_query: &str, target_query: &str) -> Result<ActionOutcome>;
     fn split_discovered_device(&self, discovered_device_id: &str) -> Result<ActionOutcome>;
     fn daemon_lifecycle(&self, action: DaemonLifecycleAction) -> Result<ActionOutcome>;
+    fn open_diagnostics_folder(&self) -> Result<ActionOutcome>;
 }
 
 #[derive(Debug, Clone)]
@@ -194,25 +235,19 @@ impl NetworkManagerActions for DaemonActions {
             if !response.accepted {
                 bail!(response.message);
             }
-            Ok(ActionOutcome {
-                message: response.message,
-            })
+            Ok(ActionOutcome::new(response.message))
         })
     }
 
     fn ensure_backend(&self) -> Result<ActionOutcome> {
         if self.daemon_available() {
-            return Ok(ActionOutcome {
-                message: "daemon already running".into(),
-            });
+            return Ok(ActionOutcome::new("Local daemon is already running."));
         }
 
         self.spawn_sidecar_daemon()?;
         for _ in 0..40 {
             if self.daemon_available() {
-                return Ok(ActionOutcome {
-                    message: "started bundled daemon".into(),
-                });
+                return Ok(ActionOutcome::new("Local daemon started."));
             }
             thread::sleep(Duration::from_millis(150));
         }
@@ -246,9 +281,7 @@ impl NetworkManagerActions for DaemonActions {
             if !response.found {
                 bail!(response.message);
             }
-            Ok(ActionOutcome {
-                message: response.message,
-            })
+            Ok(ActionOutcome::new(response.message))
         })
     }
 
@@ -275,9 +308,7 @@ impl NetworkManagerActions for DaemonActions {
             if !response.applied {
                 bail!(response.message);
             }
-            Ok(ActionOutcome {
-                message: response.message,
-            })
+            Ok(ActionOutcome::new(response.message))
         })
     }
 
@@ -302,9 +333,7 @@ impl NetworkManagerActions for DaemonActions {
             if !response.applied {
                 bail!(response.message);
             }
-            Ok(ActionOutcome {
-                message: response.message,
-            })
+            Ok(ActionOutcome::new(response.message))
         })
     }
 
@@ -322,15 +351,35 @@ impl NetworkManagerActions for DaemonActions {
             }
             DaemonLifecycleAction::Start => args.push("start".to_string()),
             DaemonLifecycleAction::Stop => args.push("stop".to_string()),
+            DaemonLifecycleAction::Restart => args.push("restart".to_string()),
         }
         let message = Self::run_cli(&args)?;
-        Ok(ActionOutcome {
-            message: if message.is_empty() {
-                format!("{} complete", action.label())
-            } else {
-                message
-            },
+        Ok(if message.is_empty() {
+            ActionOutcome::new(format!("{} complete.", action.label()))
+        } else {
+            ActionOutcome::new(message)
         })
+    }
+
+    fn open_diagnostics_folder(&self) -> Result<ActionOutcome> {
+        let log_dir = Self::log_dir();
+        std::fs::create_dir_all(&log_dir)
+            .with_context(|| format!("creating diagnostics folder {}", log_dir.display()))?;
+        let output = Command::new("open")
+            .arg(&log_dir)
+            .output()
+            .with_context(|| format!("opening diagnostics folder {}", log_dir.display()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                bail!("open exited with status {}", output.status);
+            }
+            bail!("open diagnostics folder failed: {stderr}");
+        }
+        Ok(ActionOutcome::new(format!(
+            "Opened diagnostics folder {}.",
+            log_dir.display()
+        )))
     }
 }
 
@@ -343,41 +392,45 @@ impl NetworkManagerActions for NoopActions {
     }
 
     fn refresh_device(&self, mode: RefreshMode, device_query: &str) -> Result<ActionOutcome> {
-        Ok(ActionOutcome {
-            message: format!(
-                "{} refresh for {device_query} skipped in mock mode",
-                mode.as_str()
-            ),
-        })
+        Ok(ActionOutcome::new(format!(
+            "{} refresh for {device_query} skipped in mock mode",
+            mode.as_str()
+        )))
     }
 
     fn ensure_backend(&self) -> Result<ActionOutcome> {
-        Ok(ActionOutcome {
-            message: "mock backend ready".into(),
-        })
+        Ok(ActionOutcome::new("mock backend ready"))
     }
 
     fn set_tracked_state(&self, device_query: &str, state: TrackedState) -> Result<ActionOutcome> {
-        Ok(ActionOutcome {
-            message: format!("{device_query} marked {} in mock mode", state.as_str()),
-        })
+        Ok(ActionOutcome::new(format!(
+            "{device_query} marked {} in mock mode",
+            state.as_str()
+        )))
     }
 
     fn merge_identities(&self, source_query: &str, target_query: &str) -> Result<ActionOutcome> {
-        Ok(ActionOutcome {
-            message: format!("merged {source_query} into {target_query} in mock mode"),
-        })
+        Ok(ActionOutcome::new(format!(
+            "merged {source_query} into {target_query} in mock mode"
+        )))
     }
 
     fn split_discovered_device(&self, discovered_device_id: &str) -> Result<ActionOutcome> {
-        Ok(ActionOutcome {
-            message: format!("split {discovered_device_id} in mock mode"),
-        })
+        Ok(ActionOutcome::new(format!(
+            "split {discovered_device_id} in mock mode"
+        )))
     }
 
     fn daemon_lifecycle(&self, action: DaemonLifecycleAction) -> Result<ActionOutcome> {
-        Ok(ActionOutcome {
-            message: format!("{} skipped in mock mode", action.label()),
-        })
+        Ok(ActionOutcome::new(format!(
+            "{} skipped in mock mode",
+            action.label()
+        )))
+    }
+
+    fn open_diagnostics_folder(&self) -> Result<ActionOutcome> {
+        Ok(ActionOutcome::new(
+            "opening diagnostics folder skipped in mock mode",
+        ))
     }
 }

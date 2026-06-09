@@ -4,13 +4,13 @@ use gpui::{
 };
 use network_manager_core::AvailabilityState;
 
-use crate::app::{ActionStatus, NetworkManagerApp};
+use crate::app::NetworkManagerApp;
 use crate::components::{
     buttons,
     icons::{self, Icon},
     status,
 };
-use crate::data::{QuickAccessVm, TrackedDeviceRowVm};
+use crate::data::{ActionStatus, QuickAccessVm, TrackedDeviceRowVm};
 use crate::routes::Route;
 use crate::theme::LiquidGlassTokens;
 

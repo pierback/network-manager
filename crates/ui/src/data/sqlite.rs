@@ -168,6 +168,7 @@ impl NetworkManagerRepository for SqliteRepository {
             .map(|store| daemon_vm(&store))
             .unwrap_or_else(|_| daemon_status("sqlite unavailable"));
         SettingsVm {
+            daemon: daemon.clone(),
             discovery_interval: "Daemon managed".into(),
             battery_mode: true,
             tailscale_enabled: true,

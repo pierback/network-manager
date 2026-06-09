@@ -309,6 +309,14 @@ impl NetworkManagerRepository for MockRepository {
 
     fn settings(&self) -> SettingsVm {
         SettingsVm {
+            daemon: DaemonStatusVm {
+                state: AvailabilityState::Online,
+                source: "mock daemon".into(),
+                tailscale_service: AvailabilityState::Online,
+                local_ip_address: "192.168.1.10".into(),
+                last_scan: "12s ago".into(),
+                stale: false,
+            },
             discovery_interval: "Every 5 minutes".into(),
             battery_mode: true,
             tailscale_enabled: true,

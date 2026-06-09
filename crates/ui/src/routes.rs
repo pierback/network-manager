@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Discovery,
+    SyncDiagnostics,
     EndpointPreference,
     IdentityCorrections,
     CliAlias,
@@ -8,8 +9,9 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 6] = [
         SettingsSection::Discovery,
+        SettingsSection::SyncDiagnostics,
         SettingsSection::EndpointPreference,
         SettingsSection::IdentityCorrections,
         SettingsSection::CliAlias,
@@ -19,6 +21,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Discovery => "Discovery",
+            SettingsSection::SyncDiagnostics => "Sync & Diagnostics",
             SettingsSection::EndpointPreference => "Endpoint Preference",
             SettingsSection::IdentityCorrections => "Identity Corrections",
             SettingsSection::CliAlias => "CLI Alias",

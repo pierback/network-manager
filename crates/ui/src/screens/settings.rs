@@ -1,12 +1,13 @@
 use gpui::{div, prelude::*, px, Context, Div, FontWeight, SharedString};
 use network_manager_core::AvailabilityState;
 
-use crate::app::{ActionStatus, NetworkManagerApp};
+use crate::app::NetworkManagerApp;
 use crate::components::{
     buttons,
     icons::{self, Icon},
+    status,
 };
-use crate::data::SettingsVm;
+use crate::data::{ActionStatus, SettingsVm};
 use crate::layout::app_shell::liquid_titlebar;
 use crate::routes::SettingsSection;
 use crate::theme::LiquidGlassTokens;
@@ -69,6 +70,7 @@ fn settings_sidebar(
         .children(SettingsSection::ALL.into_iter().map(|section| {
             let icon = match section {
                 SettingsSection::Discovery => Icon::Radar,
+                SettingsSection::SyncDiagnostics => Icon::Activity,
                 SettingsSection::EndpointPreference => Icon::Route,
                 SettingsSection::IdentityCorrections => Icon::GitMerge,
                 SettingsSection::CliAlias => Icon::Terminal,
@@ -179,11 +181,27 @@ fn action_status_banner(status: &ActionStatus, tokens: LiquidGlassTokens) -> Div
             div()
                 .flex_1()
                 .overflow_hidden()
-                .font_family("Geist")
-                .text_size(px(12.0))
-                .text_color(tokens.colors.text_secondary)
-                .truncate()
-                .child(status.message.clone()),
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .font_family("Geist")
+                        .text_size(px(12.0))
+                        .text_color(tokens.colors.text_secondary)
+                        .truncate()
+                        .child(status.message.clone()),
+                )
+                .when(status.detail.is_some(), |this| {
+                    this.child(
+                        div()
+                            .font_family("Geist")
+                            .text_size(px(11.0))
+                            .text_color(tokens.colors.text_muted)
+                            .truncate()
+                            .child("Open Logs for daemon diagnostics."),
+                    )
+                }),
         )
 }
 
@@ -244,6 +262,9 @@ fn settings_section_description(section: SettingsSection) -> &'static str {
         SettingsSection::Discovery => {
             "Control which local evidence sources are observed by this Mac."
         }
+        SettingsSection::SyncDiagnostics => {
+            "Inspect daemon health, refresh sync state, and open local diagnostics."
+        }
         SettingsSection::EndpointPreference => {
             "Define how LAN, mDNS, DNS, and Tailscale endpoints are ranked for SSH."
         }
@@ -267,6 +288,7 @@ fn settings_columns(
 ) -> Div {
     match selected_section {
         SettingsSection::Discovery => discovery_settings(vm, tokens, cx),
+        SettingsSection::SyncDiagnostics => sync_diagnostics_settings(vm, tokens, cx),
         SettingsSection::EndpointPreference => endpoint_preference_settings(tokens, cx),
         SettingsSection::IdentityCorrections => identity_correction_settings(vm, tokens, cx),
         SettingsSection::CliAlias => cli_alias_settings(vm, tokens, cx),
@@ -388,6 +410,169 @@ fn discovery_settings(
                     )),
                 ),
         )
+}
+
+fn sync_diagnostics_settings(
+    vm: &SettingsVm,
+    tokens: LiquidGlassTokens,
+    cx: &mut Context<NetworkManagerApp>,
+) -> Div {
+    settings_grid()
+        .child(
+            settings_stack()
+                .child(
+                    section(
+                        "Sync Health",
+                        "Daemon status and recent sync evidence for this Mac.",
+                        tokens,
+                    )
+                    .child(setting_menu(
+                        "Daemon",
+                        daemon_hint(vm),
+                        &format!(
+                            "{} via {}",
+                            status::status_text(vm.daemon.state),
+                            vm.daemon.source
+                        ),
+                        tokens,
+                    ))
+                    .child(setting_menu(
+                        "Last sync",
+                        if vm.daemon.stale {
+                            "Status is stale; refresh or restart the daemon."
+                        } else {
+                            "Latest daemon update recorded locally."
+                        },
+                        &vm.daemon.last_scan,
+                        tokens,
+                    ))
+                    .child(setting_menu(
+                        "This Mac",
+                        "Local LAN address used for pairing and same-network checks.",
+                        &vm.daemon.local_ip_address,
+                        tokens,
+                    ))
+                    .child(setting_menu(
+                        "Tailscale",
+                        "Fallback pairing and SSH evidence source when available.",
+                        status::status_text(vm.daemon.tailscale_service),
+                        tokens,
+                    )),
+                )
+                .child(
+                    section(
+                        "Sync Actions",
+                        "Request bounded refresh work from the daemon.",
+                        tokens,
+                    )
+                    .child(settings_action_row(
+                        "Refresh",
+                        "Quick scan updates status; full scan rebuilds discovery evidence.",
+                        tokens,
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                buttons::accent_icon_button("Quick scan", Icon::Refresh, tokens)
+                                    .id(SharedString::from("settings-sync-quick-scan"))
+                                    .on_click(cx.listener(|app, _, _, cx| app.refresh_quick(cx))),
+                            )
+                            .child(
+                                buttons::toolbar_icon_button("Full scan", Icon::Radar, tokens)
+                                    .id(SharedString::from("settings-sync-full-scan"))
+                                    .on_click(cx.listener(|app, _, _, cx| app.refresh_full(cx))),
+                            ),
+                    )),
+                ),
+        )
+        .child(
+            settings_stack()
+                .child(
+                    section(
+                        "Daemon Recovery",
+                        "Control the per-user LaunchAgent that keeps sync state fresh.",
+                        tokens,
+                    )
+                    .child(settings_action_row(
+                        "Run daemon",
+                        "Start or restart the installed LaunchAgent.",
+                        tokens,
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                buttons::accent_icon_button("Start", Icon::Refresh, tokens)
+                                    .id(SharedString::from("settings-daemon-start"))
+                                    .on_click(cx.listener(|app, _, _, cx| app.start_daemon(cx))),
+                            )
+                            .child(
+                                buttons::toolbar_icon_button("Restart", Icon::RotateCcw, tokens)
+                                    .id(SharedString::from("settings-daemon-restart"))
+                                    .on_click(cx.listener(|app, _, _, cx| app.restart_daemon(cx))),
+                            )
+                            .child(
+                                buttons::toolbar_icon_button("Stop", Icon::RotateCcw, tokens)
+                                    .id(SharedString::from("settings-daemon-stop"))
+                                    .on_click(cx.listener(|app, _, _, cx| app.stop_daemon(cx))),
+                            ),
+                    ))
+                    .child(settings_action_row(
+                        "Repair",
+                        "Reinstall the LaunchAgent with the bundled daemon binary and load it.",
+                        tokens,
+                        div().flex().items_center().gap(px(8.0)).child(
+                            buttons::toolbar_icon_button(
+                                "Repair daemon",
+                                Icon::ShieldCheck,
+                                tokens,
+                            )
+                            .id(SharedString::from("settings-daemon-repair"))
+                            .on_click(
+                                cx.listener(|app, _, _, cx| app.install_and_start_daemon(cx)),
+                            ),
+                        ),
+                    )),
+                )
+                .child(
+                    section(
+                        "Diagnostics",
+                        "Open local daemon logs when sync or pairing fails.",
+                        tokens,
+                    )
+                    .child(settings_action_row(
+                        "Logs",
+                        "Open ~/Library/Logs/Network Manager in Finder.",
+                        tokens,
+                        div().child(
+                            buttons::toolbar_icon_button("Open logs", Icon::Folder, tokens)
+                                .id(SharedString::from("settings-open-logs"))
+                                .on_click(
+                                    cx.listener(|app, _, _, cx| app.open_diagnostics_folder(cx)),
+                                ),
+                        ),
+                    ))
+                    .child(setting_menu(
+                        "Error details",
+                        "Action banners stay concise; open logs for raw daemon output.",
+                        "Visible after action",
+                        tokens,
+                    )),
+                ),
+        )
+}
+
+fn daemon_hint(vm: &SettingsVm) -> &'static str {
+    if vm.daemon.stale {
+        "The daemon has not reported recently."
+    } else {
+        match vm.daemon.state {
+            AvailabilityState::Online => "Local daemon is answering sync requests.",
+            AvailabilityState::Offline => "Start or repair the LaunchAgent.",
+            AvailabilityState::Unknown => "Run a scan or restart the daemon.",
+        }
+    }
 }
 
 fn endpoint_preference_settings(
@@ -596,7 +781,7 @@ fn identity_correction_settings(
 fn cli_alias_settings(
     vm: &SettingsVm,
     tokens: LiquidGlassTokens,
-    cx: &mut Context<NetworkManagerApp>,
+    _cx: &mut Context<NetworkManagerApp>,
 ) -> Div {
     settings_grid()
         .child(
@@ -640,8 +825,7 @@ fn cli_alias_settings(
                     "Return deterministic machine-readable errors for JSON commands.",
                     "Structured JSON",
                     tokens
-                )))
-                .child(daemon_launch_agent_settings(tokens, cx)),
+                ))),
         )
         .child(
             settings_stack()
@@ -686,42 +870,6 @@ fn cli_alias_settings(
                     tokens
                 ))),
         )
-}
-
-fn daemon_launch_agent_settings(
-    tokens: LiquidGlassTokens,
-    cx: &mut Context<NetworkManagerApp>,
-) -> Div {
-    section(
-        "Daemon LaunchAgent",
-        "Install or control the per-user daemon that keeps local evidence fresh.",
-        tokens,
-    )
-    .child(
-        div()
-            .px(px(14.0))
-            .py(px(12.0))
-            .border_t_1()
-            .border_color(tokens.colors.edge_soft)
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                buttons::accent_icon_button("Install", Icon::Plus, tokens)
-                    .id(SharedString::from("daemon-install-start"))
-                    .on_click(cx.listener(|app, _, _, cx| app.install_and_start_daemon(cx))),
-            )
-            .child(
-                buttons::toolbar_icon_button("Start", Icon::Refresh, tokens)
-                    .id(SharedString::from("daemon-start"))
-                    .on_click(cx.listener(|app, _, _, cx| app.start_daemon(cx))),
-            )
-            .child(
-                buttons::toolbar_icon_button("Stop", Icon::RotateCcw, tokens)
-                    .id(SharedString::from("daemon-stop"))
-                    .on_click(cx.listener(|app, _, _, cx| app.stop_daemon(cx))),
-            ),
-    )
 }
 
 fn notification_settings(
@@ -904,6 +1052,15 @@ fn setting_row(label: &str, detail: &str, tokens: LiquidGlassTokens) -> Div {
                         .child(detail.to_string()),
                 ),
         )
+}
+
+fn settings_action_row(
+    label: &str,
+    detail: &str,
+    tokens: LiquidGlassTokens,
+    controls: impl IntoElement,
+) -> Div {
+    setting_row(label, detail, tokens).child(controls)
 }
 
 fn setting_value_badge(value: &str, tokens: LiquidGlassTokens) -> Div {

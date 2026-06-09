@@ -4,9 +4,9 @@ use gpui::{
 };
 use network_manager_core::AvailabilityState;
 
-use crate::app::{ActionStatus, NetworkManagerApp};
+use crate::app::NetworkManagerApp;
 use crate::components::{buttons, icons::Icon, status};
-use crate::data::{DeviceDetailVm, DeviceIdentityVm, EndpointGroup, EndpointVm};
+use crate::data::{ActionStatus, DeviceDetailVm, DeviceIdentityVm, EndpointGroup, EndpointVm};
 use crate::layout::app_shell::liquid_titlebar;
 use crate::theme::LiquidGlassTokens;
 

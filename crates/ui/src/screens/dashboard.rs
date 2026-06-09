@@ -4,9 +4,9 @@ use gpui::{
 };
 use network_manager_core::AvailabilityState;
 
-use crate::app::{ActionStatus, NetworkManagerApp};
+use crate::app::NetworkManagerApp;
 use crate::components::{buttons, icons::Icon, status};
-use crate::data::{DashboardVm, TrackedDeviceRowVm};
+use crate::data::{ActionStatus, DashboardVm, TrackedDeviceRowVm};
 use crate::layout::app_shell::v4_route_shell;
 use crate::routes::Route;
 use crate::theme::LiquidGlassTokens;
@@ -64,7 +64,7 @@ fn header(
     let label = if action_status.is_some_and(|status| status.is_pending) {
         "Scanning"
     } else {
-        "Scan"
+        "Quick scan"
     };
     div()
         .flex()
