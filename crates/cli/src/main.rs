@@ -1608,26 +1608,11 @@ async fn list_devices(
                     })
                     .await?
                     .into_inner();
-                return Ok(response
+                return response
                     .identities
                     .into_iter()
-                    .map(|identity| DeviceOutput {
-                        id: identity.id,
-                        stable_key: identity.stable_key,
-                        label: empty_to_none(identity.label),
-                        alias: empty_to_none(identity.alias),
-                        tracked_state: identity.tracked_state,
-                        category: empty_to_none(identity.category),
-                        tags: identity.tags,
-                        ssh_username: empty_to_none(identity.ssh_username),
-                        ssh_port: u16::try_from(identity.ssh_port)
-                            .ok()
-                            .filter(|port| *port != 0),
-                        endpoint_preference: identity.endpoint_preference,
-                        last_seen_at: empty_to_none(identity.last_seen_at),
-                        endpoint_count: identity.endpoint_count as usize,
-                    })
-                    .collect());
+                    .map(device_output_from_ipc)
+                    .collect::<Result<Vec<_>>>();
             }
             Err(error) if cli.require_daemon => {
                 eprintln!("daemon unavailable: {error:#}");
@@ -2287,12 +2272,12 @@ fn device_details_from_response(response: GetDeviceDetailsResponse) -> Result<De
         .device
         .context("daemon returned a found details response without a device")?;
     Ok(DeviceDetailsOutput {
-        device: device_output_from_ipc(device),
+        device: device_output_from_ipc(device)?,
         endpoints: response
             .endpoints
             .into_iter()
             .map(endpoint_output_from_ipc)
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -2314,7 +2299,7 @@ fn mutation_from_response(response: DeviceMutationResponse) -> Result<DeviceMuta
         .context("daemon returned a mutation response without a device")?;
     let endpoint_count = device.endpoint_count as usize;
     Ok(DeviceMutationResult {
-        identity: identity_from_ipc(device),
+        identity: identity_from_ipc(device)?,
         endpoint_count,
         message: response.message,
     })
@@ -2344,43 +2329,70 @@ fn correction_from_response(
 
 fn identity_from_ipc(
     identity: network_manager_ipc::pb::DeviceIdentity,
-) -> network_manager_core::DeviceIdentity {
-    network_manager_core::DeviceIdentity {
+) -> Result<network_manager_core::DeviceIdentity> {
+    let tracked_state = TrackedState::from_str(&identity.tracked_state).with_context(|| {
+        format!(
+            "daemon returned invalid tracked_state '{}'",
+            identity.tracked_state
+        )
+    })?;
+    let endpoint_preference = EndpointPreference::from_str(&identity.endpoint_preference)
+        .with_context(|| {
+            format!(
+                "daemon returned invalid endpoint_preference '{}'",
+                identity.endpoint_preference
+            )
+        })?;
+
+    Ok(network_manager_core::DeviceIdentity {
         id: identity.id,
         stable_key: identity.stable_key,
         label: empty_to_none(identity.label),
         alias: empty_to_none(identity.alias),
-        tracked_state: TrackedState::from_str(&identity.tracked_state)
-            .unwrap_or(TrackedState::Untracked),
+        tracked_state,
         category: empty_to_none(identity.category),
         tags: identity.tags,
         ssh_username: empty_to_none(identity.ssh_username),
-        ssh_port: u16::try_from(identity.ssh_port)
-            .ok()
-            .filter(|port| *port != 0),
-        endpoint_preference: EndpointPreference::from_str(&identity.endpoint_preference)
-            .unwrap_or(EndpointPreference::Auto),
+        ssh_port: optional_ipc_port("ssh_port", identity.ssh_port)?,
+        endpoint_preference,
         last_seen_at: empty_to_none(identity.last_seen_at),
-    }
+    })
 }
 
-fn device_output_from_ipc(identity: network_manager_ipc::pb::DeviceIdentity) -> DeviceOutput {
+fn device_output_from_ipc(
+    identity: network_manager_ipc::pb::DeviceIdentity,
+) -> Result<DeviceOutput> {
     let endpoint_count = identity.endpoint_count as usize;
-    device_output_from_identity(identity_from_ipc(identity), endpoint_count)
+    Ok(device_output_from_identity(
+        identity_from_ipc(identity)?,
+        endpoint_count,
+    ))
 }
 
-fn endpoint_output_from_ipc(endpoint: network_manager_ipc::pb::NetworkEndpoint) -> EndpointOutput {
-    EndpointOutput {
+fn endpoint_output_from_ipc(
+    endpoint: network_manager_ipc::pb::NetworkEndpoint,
+) -> Result<EndpointOutput> {
+    Ok(EndpointOutput {
         id: endpoint.id,
         kind: endpoint.kind,
         address: endpoint.address,
-        port: u16::try_from(endpoint.port).ok().filter(|port| *port != 0),
+        port: optional_ipc_port("endpoint.port", endpoint.port)?,
         hostname: empty_to_none(endpoint.hostname),
         reachability: endpoint.reachability,
         ssh_capability: endpoint.ssh_capability,
         last_seen_at: empty_to_none(endpoint.last_seen_at),
         last_checked_at: empty_to_none(endpoint.last_checked_at),
+    })
+}
+
+fn optional_ipc_port(field_name: &str, value: u32) -> Result<Option<u16>> {
+    if value == 0 {
+        return Ok(None);
     }
+
+    u16::try_from(value)
+        .map(Some)
+        .with_context(|| format!("daemon returned invalid {field_name} {value}"))
 }
 
 fn print_correction(result: IdentityCorrectionResult, json: bool) -> Result<()> {
@@ -2458,7 +2470,7 @@ async fn resolve(
                     candidate_identity_ids: response.candidate_identity_ids,
                     endpoint_id: empty_to_none(response.endpoint_id),
                     host: empty_to_none(response.host),
-                    port: u16::try_from(response.port).ok().filter(|port| *port != 0),
+                    port: optional_ipc_port("resolve port", response.port)?,
                     username: empty_to_none(response.username),
                     endpoint_kind: empty_to_none(response.endpoint_kind),
                     ssh_args: response.ssh_args,

@@ -33,7 +33,7 @@ impl std::str::FromStr for AvailabilityState {
         match value {
             "online" => Ok(Self::Online),
             "offline" => Ok(Self::Offline),
-            "unknown" | "stale" | "degraded" => Ok(Self::Unknown),
+            "unknown" => Ok(Self::Unknown),
             other => Err(ParseDomainEnumError::new("AvailabilityState", other)),
         }
     }
@@ -137,7 +137,7 @@ impl std::str::FromStr for EndpointPreference {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "auto" => Ok(Self::Auto),
-            "local_first" | "lan_then_tailscale" => Ok(Self::LocalFirst),
+            "local_first" => Ok(Self::LocalFirst),
             "lan_first" => Ok(Self::LanFirst),
             "tailscale_first" => Ok(Self::TailscaleFirst),
             other => Err(ParseDomainEnumError::new("EndpointPreference", other)),
@@ -486,5 +486,16 @@ mod tests {
             target.command_args(),
             vec!["-p", "2222", "mac.tailnet.ts.net"]
         );
+    }
+
+    #[test]
+    fn availability_state_rejects_obsolete_status_aliases() {
+        assert!("stale".parse::<AvailabilityState>().is_err());
+        assert!("degraded".parse::<AvailabilityState>().is_err());
+    }
+
+    #[test]
+    fn endpoint_preference_rejects_obsolete_local_first_alias() {
+        assert!("lan_then_tailscale".parse::<EndpointPreference>().is_err());
     }
 }

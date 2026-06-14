@@ -1,9 +1,11 @@
 use anyhow::{bail, Context, Result};
 use network_manager_core::{
-    AvailabilityState, DeviceIdentity, DiscoveredDevice, EndpointKind, EndpointPreference,
-    NetworkEndpoint, TrackedState,
+    AvailabilityState, DeviceIdentity, DiscoveredDevice, EndpointPreference, NetworkEndpoint,
+    TrackedState,
 };
+use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -295,17 +297,15 @@ impl SqliteStore {
                     stable_key: row.get(1)?,
                     label: row.get(2)?,
                     alias: row.get(3)?,
-                    tracked_state: TrackedState::from_str(&tracked_state_text)
-                        .unwrap_or(TrackedState::Untracked),
+                    tracked_state: parse_row_enum(4, &tracked_state_text)?,
                     category: row.get(5)?,
                     tags,
                     ssh_username: row.get(6)?,
-                    ssh_port: ssh_port.and_then(|port| u16::try_from(port).ok()),
-                    endpoint_preference: EndpointPreference::from_str(&endpoint_preference_text)
-                        .unwrap_or(EndpointPreference::Auto),
+                    ssh_port: parse_optional_port(7, ssh_port)?,
+                    endpoint_preference: parse_row_enum(8, &endpoint_preference_text)?,
                     last_seen_at: row.get(9)?,
                 },
-                endpoint_count: endpoint_count as usize,
+                endpoint_count: parse_nonnegative_count(10, endpoint_count)?,
             })
         })?;
 
@@ -2042,16 +2042,47 @@ fn endpoint_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NetworkEndpoin
     Ok(NetworkEndpoint {
         id: row.get(0)?,
         identity_id: row.get(1)?,
-        kind: EndpointKind::from_str(&kind_text).unwrap_or(EndpointKind::Other),
+        kind: parse_row_enum(2, &kind_text)?,
         address: row.get(3)?,
-        port: port.and_then(|port| u16::try_from(port).ok()),
+        port: parse_optional_port(4, port)?,
         hostname: row.get(5)?,
-        reachability: AvailabilityState::from_str(&reachability_text)
-            .unwrap_or(AvailabilityState::Unknown),
-        ssh_capability: AvailabilityState::from_str(&ssh_capability_text)
-            .unwrap_or(AvailabilityState::Unknown),
+        reachability: parse_row_enum(6, &reachability_text)?,
+        ssh_capability: parse_row_enum(7, &ssh_capability_text)?,
         last_seen_at: row.get(8)?,
         last_checked_at: row.get(9)?,
+    })
+}
+
+fn parse_row_enum<T>(column_index: usize, value: &str) -> rusqlite::Result<T>
+where
+    T: FromStr,
+    T::Err: Error + Send + Sync + 'static,
+{
+    T::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column_index, Type::Text, Box::new(error))
+    })
+}
+
+fn parse_optional_port(column_index: usize, value: Option<i64>) -> rusqlite::Result<Option<u16>> {
+    match value {
+        Some(port) if port > 0 => u16::try_from(port).map(Some).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(column_index, Type::Integer, Box::new(error))
+        }),
+        Some(_) => Err(rusqlite::Error::FromSqlConversionFailure(
+            column_index,
+            Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "port must be between 1 and 65535",
+            )),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn parse_nonnegative_count(column_index: usize, value: i64) -> rusqlite::Result<usize> {
+    usize::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column_index, Type::Integer, Box::new(error))
     })
 }
 
@@ -2075,6 +2106,7 @@ fn now_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use network_manager_core::EndpointKind;
 
     #[test]
     fn migration_creates_empty_store() {

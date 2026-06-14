@@ -5,8 +5,8 @@ use network_manager_core::{
     EndpointPreference, NetworkEndpoint, TrackedState,
 };
 use network_manager_db::{
-    IdentityLookup, LanDeviceObservation, MdnsServiceObservation, SqliteStore,
-    TailscaleNodeObservation,
+    DeviceIdentityRecord, IdentityLookup, LanDeviceObservation, MdnsServiceObservation,
+    SqliteStore, TailscaleNodeObservation,
 };
 use network_manager_ipc::pb::network_manager_server::{NetworkManager, NetworkManagerServer};
 use network_manager_ipc::pb::{
@@ -265,23 +265,7 @@ impl NetworkManager for DaemonService {
         }
 
         Ok(Response::new(ListDeviceIdentitiesResponse {
-            identities: identities
-                .into_iter()
-                .map(|record| DeviceIdentity {
-                    id: record.identity.id,
-                    stable_key: record.identity.stable_key,
-                    label: record.identity.label.unwrap_or_default(),
-                    alias: record.identity.alias.unwrap_or_default(),
-                    tracked_state: record.identity.tracked_state.as_str().to_string(),
-                    category: record.identity.category.unwrap_or_default(),
-                    tags: record.identity.tags,
-                    ssh_username: record.identity.ssh_username.unwrap_or_default(),
-                    ssh_port: record.identity.ssh_port.unwrap_or_default() as u32,
-                    endpoint_preference: record.identity.endpoint_preference.as_str().to_string(),
-                    last_seen_at: record.identity.last_seen_at.unwrap_or_default(),
-                    endpoint_count: record.endpoint_count as u32,
-                })
-                .collect(),
+            identities: device_identity_records_to_ipc(identities)?,
         }))
     }
 
@@ -337,7 +321,7 @@ impl NetworkManager for DaemonService {
             found: true,
             ambiguous: false,
             candidate_identity_ids: vec![details.identity.id.clone()],
-            device: Some(device_identity_to_ipc(details.identity, endpoint_count)),
+            device: Some(device_identity_to_ipc(details.identity, endpoint_count)?),
             endpoints: details.endpoints.into_iter().map(endpoint_to_ipc).collect(),
             message: "found".to_string(),
         }))
@@ -508,8 +492,9 @@ impl NetworkManager for DaemonService {
         let preference = if request.endpoint_preference.is_empty() {
             EndpointPreference::Auto
         } else {
-            EndpointPreference::from_str(&request.endpoint_preference)
-                .unwrap_or(EndpointPreference::Auto)
+            EndpointPreference::from_str(&request.endpoint_preference).map_err(|error| {
+                Status::invalid_argument(format!("invalid endpoint_preference: {error}"))
+            })?
         };
 
         let store = self.store.lock().map_err(lock_error)?;
@@ -592,7 +577,7 @@ impl DaemonService {
             Err(failure) => return Ok(Response::new(mutation_lookup_failure(failure))),
         };
         let result = mutate(&store, &identity_id).map_err(internal_error)?;
-        Ok(Response::new(mutation_success(result)))
+        Ok(Response::new(mutation_success(result)?))
     }
 }
 
@@ -657,17 +642,20 @@ fn correction_lookup_failure(failure: LookupFailure) -> IdentityCorrectionRespon
     }
 }
 
-fn mutation_success(result: network_manager_db::DeviceMutationResult) -> DeviceMutationResponse {
-    DeviceMutationResponse {
+#[allow(clippy::result_large_err)]
+fn mutation_success(
+    result: network_manager_db::DeviceMutationResult,
+) -> std::result::Result<DeviceMutationResponse, Status> {
+    Ok(DeviceMutationResponse {
         found: true,
         ambiguous: false,
         candidate_identity_ids: vec![result.identity.id.clone()],
         device: Some(device_identity_to_ipc(
             result.identity,
             result.endpoint_count,
-        )),
+        )?),
         message: result.message,
-    }
+    })
 }
 
 fn correction_success(
@@ -683,8 +671,22 @@ fn correction_success(
     }
 }
 
-fn device_identity_to_ipc(identity: CoreDeviceIdentity, endpoint_count: usize) -> DeviceIdentity {
-    DeviceIdentity {
+#[allow(clippy::result_large_err)]
+fn device_identity_records_to_ipc(
+    records: Vec<DeviceIdentityRecord>,
+) -> std::result::Result<Vec<DeviceIdentity>, Status> {
+    records
+        .into_iter()
+        .map(|record| device_identity_to_ipc(record.identity, record.endpoint_count))
+        .collect()
+}
+
+#[allow(clippy::result_large_err)]
+fn device_identity_to_ipc(
+    identity: CoreDeviceIdentity,
+    endpoint_count: usize,
+) -> std::result::Result<DeviceIdentity, Status> {
+    Ok(DeviceIdentity {
         id: identity.id,
         stable_key: identity.stable_key,
         label: identity.label.unwrap_or_default(),
@@ -696,8 +698,14 @@ fn device_identity_to_ipc(identity: CoreDeviceIdentity, endpoint_count: usize) -
         ssh_port: identity.ssh_port.unwrap_or_default() as u32,
         endpoint_preference: identity.endpoint_preference.as_str().to_string(),
         last_seen_at: identity.last_seen_at.unwrap_or_default(),
-        endpoint_count: endpoint_count as u32,
-    }
+        endpoint_count: endpoint_count_to_ipc(endpoint_count)?,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn endpoint_count_to_ipc(endpoint_count: usize) -> std::result::Result<u32, Status> {
+    u32::try_from(endpoint_count)
+        .map_err(|_| Status::internal("endpoint count exceeds IPC response range"))
 }
 
 fn endpoint_to_ipc(endpoint: NetworkEndpoint) -> IpcNetworkEndpoint {
