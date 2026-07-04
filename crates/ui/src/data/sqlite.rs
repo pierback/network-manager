@@ -92,13 +92,27 @@ impl NetworkManagerRepository for SqliteRepository {
                 possible_match: Some("SQLite store unavailable".into()),
             };
         };
+        let identities_by_id = store
+            .list_device_identities()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| (record.identity.id.clone(), record.identity))
+            .collect::<HashMap<_, _>>();
+        let endpoints_by_identity = endpoints_by_identity(&store).ok();
         let rows = collapse_discovery_rows(
             store
                 .list_discovered_devices()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|record| !is_noisy_discovery(record))
-                .map(|record| discovery_row(&store, record))
+                .map(|record| {
+                    let details = discovery_details(
+                        &record,
+                        &identities_by_id,
+                        endpoints_by_identity.as_ref(),
+                    );
+                    discovery_row(record, details)
+                })
                 .collect(),
         );
         DiscoveryVm {
@@ -335,11 +349,23 @@ fn is_noisy_discovery(record: &DiscoveredDeviceRecord) -> bool {
             || record.device.source_device_id.contains(":_airplay._tcp:"))
 }
 
-fn discovery_row(store: &SqliteStore, record: DiscoveredDeviceRecord) -> DiscoveryRowVm {
-    let details = record
-        .identity_id
-        .as_ref()
-        .and_then(|identity_id| store.device_details_by_id(identity_id).ok().flatten());
+fn discovery_details(
+    record: &DiscoveredDeviceRecord,
+    identities_by_id: &HashMap<String, DeviceIdentity>,
+    endpoints_by_identity: Option<&HashMap<String, Vec<NetworkEndpoint>>>,
+) -> Option<DeviceDetails> {
+    let identity_id = record.identity_id.as_ref()?;
+    let endpoints_by_identity = endpoints_by_identity?;
+    Some(DeviceDetails {
+        identity: identities_by_id.get(identity_id)?.clone(),
+        endpoints: endpoints_by_identity
+            .get(identity_id)
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+fn discovery_row(record: DiscoveredDeviceRecord, details: Option<DeviceDetails>) -> DiscoveryRowVm {
     let display_name = record
         .device
         .display_name
@@ -531,6 +557,8 @@ fn device_detail(details: DeviceDetails, device_list: Vec<DeviceIdentityVm>) -> 
                 group: endpoint_group(endpoint.kind),
                 kind: endpoint.kind,
                 address: endpoint.address.clone(),
+                hostname: endpoint.hostname.clone(),
+                port: endpoint.port,
                 reachability: endpoint.reachability,
                 ssh_capability: endpoint.ssh_capability,
                 last_checked: endpoint
@@ -992,6 +1020,7 @@ mod tests {
                     service_type: "_ssh._tcp".to_string(),
                     domain: "local".to_string(),
                     hostname: Some("nas.local".to_string()),
+                    ip_addresses: Vec::new(),
                     port: Some(22),
                     raw_text: "NAS._ssh._tcp.local. can be reached at nas.local.:22".to_string(),
                 },
@@ -1001,6 +1030,7 @@ mod tests {
                     service_type: "_smb._tcp".to_string(),
                     domain: "local".to_string(),
                     hostname: Some("nas.local".to_string()),
+                    ip_addresses: Vec::new(),
                     port: Some(445),
                     raw_text: "NAS._smb._tcp.local. can be reached at nas.local.:445".to_string(),
                 },
@@ -1010,6 +1040,7 @@ mod tests {
                     service_type: "_smb._tcp".to_string(),
                     domain: "local".to_string(),
                     hostname: None,
+                    ip_addresses: Vec::new(),
                     port: None,
                     raw_text: "192-168-178-1._smb._tcp.local.".to_string(),
                 },
@@ -1044,6 +1075,46 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn discovery_projection_preserves_identity_details_from_batched_lookup() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+        store
+            .record_lan_devices(&[LanDeviceObservation {
+                ip_address: "192.168.1.20".into(),
+                hostname: Some("Lab NAS".into()),
+                mac_address: Some("AA:BB:CC:00:11:33".into()),
+                interface_name: Some("en0".into()),
+                raw_text: "Lab NAS (192.168.1.20) at aa:bb:cc:00:11:33 on en0".into(),
+            }])
+            .unwrap();
+        let identity_id = match store.find_identity_id("Lab NAS").unwrap() {
+            network_manager_db::IdentityLookup::Found(id) => id,
+            other => panic!("expected identity, got {other:?}"),
+        };
+        store
+            .set_tracked_state_by_id(&identity_id, TrackedState::Tracked, Some("Lab NAS"), None)
+            .unwrap();
+        store
+            .set_category_by_id(&identity_id, Some("NAS / Storage"))
+            .unwrap();
+
+        let discovery = SqliteRepository::new(&path).discovery();
+        let row = discovery
+            .rows
+            .iter()
+            .find(|row| row.identity_id.as_deref() == Some(identity_id.as_str()))
+            .expect("tracked LAN identity appears in discovery");
+
+        assert_eq!(row.tracked_state, TrackedState::Tracked);
+        assert_eq!(row.category, "NAS / Storage");
+        assert_eq!(row.hostname, "Lab NAS");
+        assert_eq!(row.ip_address, "192.168.1.20");
+        assert_eq!(row.sources, vec!["LAN".to_string(), "ARP".to_string()]);
     }
 
     #[test]
@@ -1104,6 +1175,7 @@ mod tests {
                 service_type: "_workstation._tcp".to_string(),
                 domain: "local".to_string(),
                 hostname: Some("homeassistant.local".to_string()),
+                ip_addresses: Vec::new(),
                 port: None,
                 raw_text:
                     "homeassistant._workstation._tcp.local. can be reached at homeassistant.local."

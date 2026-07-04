@@ -3,9 +3,14 @@ use gpui::{
     StatefulInteractiveElement,
 };
 use network_manager_core::AvailabilityState;
+use std::net::IpAddr;
 
 use crate::app::NetworkManagerApp;
-use crate::components::{buttons, icons::Icon, status};
+use crate::components::{
+    buttons,
+    icons::{self, Icon},
+    status,
+};
 use crate::data::{ActionStatus, DeviceDetailVm, DeviceIdentityVm, EndpointGroup, EndpointVm};
 use crate::layout::app_shell::liquid_titlebar;
 use crate::theme::LiquidGlassTokens;
@@ -128,7 +133,7 @@ fn selector_row(
 
 fn inspector(
     vm: &DeviceDetailVm,
-    _action_status: Option<&ActionStatus>,
+    action_status: Option<&ActionStatus>,
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> impl IntoElement {
@@ -145,6 +150,9 @@ fn inspector(
         .flex_col()
         .gap(px(18.0))
         .child(hero(vm, tokens, cx))
+        .when_some(action_status, |this, status| {
+            this.child(detail_status_banner(status, tokens))
+        })
         .child(
             div()
                 .h(px(554.0))
@@ -203,6 +211,7 @@ fn hero(
                 .child(match ssh_command {
                     Some(_) => buttons::toolbar_icon_button("SSH", Icon::Terminal, tokens)
                         .id(SharedString::from("detail-copy-ssh-command"))
+                        .active(|style| style.bg(gpui::rgba(0xa9d8ff33)))
                         .on_click(cx.listener(|app, _, _, cx| app.copy_selected_ssh_command(cx)))
                         .into_any_element(),
                     None => buttons::disabled_icon_button("SSH", Icon::Terminal, tokens)
@@ -211,6 +220,7 @@ fn hero(
                 .child(match target {
                     Some(_) => buttons::toolbar_icon_button("Copy target", Icon::Copy, tokens)
                         .id(SharedString::from("detail-copy-target"))
+                        .active(|style| style.bg(gpui::rgba(0xa9d8ff33)))
                         .on_click(cx.listener(|app, _, _, cx| app.copy_selected_target(cx)))
                         .into_any_element(),
                     None => buttons::disabled_icon_button("Copy target", Icon::Copy, tokens)
@@ -219,10 +229,66 @@ fn hero(
         )
 }
 
+fn detail_status_banner(status: &ActionStatus, tokens: LiquidGlassTokens) -> Div {
+    let color = if status.is_error {
+        tokens.colors.offline
+    } else if status.is_pending {
+        tokens.colors.unknown
+    } else {
+        tokens.colors.online
+    };
+    let icon = if status.is_error {
+        Icon::Info
+    } else if status.is_pending {
+        Icon::Refresh
+    } else {
+        Icon::Check
+    };
+
+    div()
+        .min_h(px(42.0))
+        .rounded(px(14.0))
+        .bg(gpui::rgba(0xffffff0c))
+        .border_1()
+        .border_color(tokens.colors.edge_soft)
+        .px(px(14.0))
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .child(icons::icon(icon, 15.0, color))
+        .child(
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .font_family("Geist")
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tokens.colors.text_secondary)
+                        .truncate()
+                        .child(status.message.clone()),
+                )
+                .when(status.detail.is_some(), |this| {
+                    this.child(
+                        div()
+                            .font_family("Geist")
+                            .text_size(px(11.0))
+                            .text_color(tokens.colors.text_muted)
+                            .truncate()
+                            .child("Open Logs for daemon diagnostics."),
+                    )
+                }),
+        )
+}
+
 fn endpoint_groups(vm: &DeviceDetailVm, tokens: LiquidGlassTokens) -> Div {
-    let lan = first_endpoint(vm, EndpointGroup::Lan);
-    let tailscale = first_endpoint(vm, EndpointGroup::Tailscale);
-    let observed = vm.endpoints.first();
+    let lan = endpoints_for_group(vm, EndpointGroup::Lan);
+    let tailscale = endpoints_for_group(vm, EndpointGroup::Tailscale);
+    let observed = observed_name_endpoints(vm);
     div()
         .flex_1()
         .grid()
@@ -230,19 +296,19 @@ fn endpoint_groups(vm: &DeviceDetailVm, tokens: LiquidGlassTokens) -> Div {
         .gap(px(14.0))
         .child(endpoint_card(
             "LAN Endpoints",
-            lan,
+            &lan,
             "Network Proximity · SSH capable",
             tokens,
         ))
         .child(endpoint_card(
             "Tailscale Endpoints",
-            tailscale,
+            &tailscale,
             "Tailscale Presence · SSH capable",
             tokens,
         ))
         .child(endpoint_card(
             "Observed Names",
-            observed,
+            &observed,
             "Identity Evidence · discovery",
             tokens,
         ))
@@ -250,16 +316,16 @@ fn endpoint_groups(vm: &DeviceDetailVm, tokens: LiquidGlassTokens) -> Div {
 
 fn endpoint_card(
     title: &str,
-    endpoint: Option<&EndpointVm>,
+    endpoints: &[&EndpointVm],
     description: &str,
     tokens: LiquidGlassTokens,
 ) -> Div {
-    let endpoint_text = endpoint
-        .map(|endpoint| endpoint.address.clone())
-        .unwrap_or_else(|| "—".into());
-    let reachability = endpoint
-        .map(|endpoint| endpoint.reachability)
-        .unwrap_or(AvailabilityState::Unknown);
+    let endpoint_text = endpoint_primary_text(endpoints);
+    let host_text = endpoint_host_text(endpoints);
+    let ip_text = endpoint_ip_text(endpoints);
+    let port_text = endpoint_port_text(endpoints);
+    let last_checked = endpoint_last_checked_text(endpoints);
+    let reachability = endpoint_group_reachability(endpoints);
     div()
         .rounded(px(20.0))
         .bg(tokens.colors.panel)
@@ -309,12 +375,137 @@ fn endpoint_card(
                 .text_color(tokens.colors.text)
                 .child(endpoint_text),
         )
+        .child(endpoint_detail_row("Host", host_text, tokens))
+        .child(endpoint_detail_row("IP", ip_text, tokens))
+        .child(endpoint_detail_row("Port", port_text, tokens))
+        .child(endpoint_detail_row("Last checked", last_checked, tokens))
         .child(
             div()
                 .font_family("Geist")
                 .text_size(px(12.0))
                 .text_color(tokens.colors.text_muted)
                 .child(description.to_string()),
+        )
+}
+
+fn endpoints_for_group(vm: &DeviceDetailVm, group: EndpointGroup) -> Vec<&EndpointVm> {
+    vm.endpoints
+        .iter()
+        .filter(|endpoint| endpoint.group == group)
+        .collect()
+}
+
+fn observed_name_endpoints(vm: &DeviceDetailVm) -> Vec<&EndpointVm> {
+    vm.endpoints
+        .iter()
+        .filter(|endpoint| !is_ip_address(&endpoint.address))
+        .collect()
+}
+
+fn endpoint_primary_text(endpoints: &[&EndpointVm]) -> String {
+    endpoint_host(endpoints)
+        .or_else(|| endpoint_ips(endpoints).into_iter().next())
+        .unwrap_or_else(|| "—".into())
+}
+
+fn endpoint_host_text(endpoints: &[&EndpointVm]) -> String {
+    endpoint_host(endpoints).unwrap_or_else(|| "—".into())
+}
+
+fn endpoint_ip_text(endpoints: &[&EndpointVm]) -> String {
+    let ips = endpoint_ips(endpoints);
+    if ips.is_empty() {
+        "—".into()
+    } else {
+        ips.join(", ")
+    }
+}
+
+fn endpoint_port_text(endpoints: &[&EndpointVm]) -> String {
+    endpoints
+        .iter()
+        .find_map(|endpoint| endpoint.port)
+        .map(|port| port.to_string())
+        .unwrap_or_else(|| "—".into())
+}
+
+fn endpoint_last_checked_text(endpoints: &[&EndpointVm]) -> String {
+    endpoints
+        .iter()
+        .map(|endpoint| endpoint.last_checked.as_str())
+        .find(|value| *value != "never")
+        .or_else(|| {
+            endpoints
+                .first()
+                .map(|endpoint| endpoint.last_checked.as_str())
+        })
+        .unwrap_or("—")
+        .to_string()
+}
+
+fn endpoint_host(endpoints: &[&EndpointVm]) -> Option<String> {
+    endpoints
+        .iter()
+        .find_map(|endpoint| endpoint.hostname.as_deref())
+        .or_else(|| {
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.address.as_str())
+                .find(|address| !is_ip_address(address))
+        })
+        .map(ToString::to_string)
+}
+
+fn endpoint_ips(endpoints: &[&EndpointVm]) -> Vec<String> {
+    let mut ips = Vec::new();
+    for endpoint in endpoints {
+        if is_ip_address(&endpoint.address) && !ips.contains(&endpoint.address) {
+            ips.push(endpoint.address.clone());
+        }
+    }
+    ips
+}
+
+fn endpoint_group_reachability(endpoints: &[&EndpointVm]) -> AvailabilityState {
+    if endpoints
+        .iter()
+        .any(|endpoint| endpoint.reachability == AvailabilityState::Online)
+    {
+        return AvailabilityState::Online;
+    }
+    if endpoints
+        .iter()
+        .any(|endpoint| endpoint.reachability == AvailabilityState::Offline)
+    {
+        return AvailabilityState::Offline;
+    }
+    AvailabilityState::Unknown
+}
+
+fn is_ip_address(value: &str) -> bool {
+    value.parse::<IpAddr>().is_ok()
+}
+
+fn endpoint_detail_row(label: &str, value: String, tokens: LiquidGlassTokens) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(
+            div()
+                .font_family("Geist Mono")
+                .text_size(px(10.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(tokens.colors.text_muted)
+                .child(label.to_ascii_uppercase()),
+        )
+        .child(
+            div()
+                .font_family("Geist Mono")
+                .text_size(px(11.0))
+                .text_color(tokens.colors.text_secondary)
+                .child(value),
         )
 }
 
@@ -455,8 +646,4 @@ fn meta_row(label: &str, value: &str, tokens: LiquidGlassTokens) -> Div {
                 .text_color(tokens.colors.text_secondary)
                 .child(value.to_string()),
         )
-}
-
-fn first_endpoint(vm: &DeviceDetailVm, group: EndpointGroup) -> Option<&EndpointVm> {
-    vm.endpoints.iter().find(|endpoint| endpoint.group == group)
 }

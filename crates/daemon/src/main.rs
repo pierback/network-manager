@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use network_manager_core::{
-    resolve_ssh_target, AvailabilityState, DeviceIdentity as CoreDeviceIdentity,
+    resolve_ssh_target, AvailabilityState, DeviceIdentity as CoreDeviceIdentity, EndpointKind,
     EndpointPreference, NetworkEndpoint, TrackedState,
 };
 use network_manager_db::{
@@ -21,7 +21,7 @@ use network_manager_ipc::pb::{
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::str::FromStr;
@@ -223,6 +223,20 @@ impl NetworkManager for DaemonService {
                 }
             }
         };
+
+        let resolved_endpoint_ips = resolve_existing_endpoint_ips(&endpoints).await;
+        if !resolved_endpoint_ips.is_empty() {
+            let store = self.store.lock().map_err(lock_error)?;
+            let mut changed = 0;
+            for resolved in &resolved_endpoint_ips {
+                changed += store
+                    .record_resolved_endpoint_ips(&resolved.endpoint, &resolved.ip_addresses)
+                    .map_err(internal_error)?;
+            }
+            if changed > 0 {
+                messages.push(format!("resolved {changed} endpoint IP address(es)"));
+            }
+        }
 
         let probe_results = probe_ssh_endpoints(endpoints).await;
         if !probe_results.is_empty() {
@@ -1043,6 +1057,10 @@ async fn refresh_mdns_services() -> Result<Vec<MdnsServiceObservation>> {
             let (hostname, port) = parse_dns_sd_resolve(&resolve_output)
                 .map(|(hostname, port)| (Some(hostname), Some(port)))
                 .unwrap_or((None, None));
+            let ip_addresses = match hostname.as_deref() {
+                Some(hostname) => resolve_mdns_ip_addresses(hostname).await,
+                None => Vec::new(),
+            };
             let raw_text = if resolve_output.trim().is_empty() {
                 service.raw_line.clone()
             } else {
@@ -1058,6 +1076,7 @@ async fn refresh_mdns_services() -> Result<Vec<MdnsServiceObservation>> {
                 service_type: service.service_type,
                 domain: service.domain,
                 hostname,
+                ip_addresses,
                 port,
                 raw_text,
             });
@@ -1148,6 +1167,31 @@ fn parse_dns_sd_resolve(output: &str) -> Option<(String, u16)> {
     None
 }
 
+async fn resolve_mdns_ip_addresses(hostname: &str) -> Vec<String> {
+    let output = capture_dns_sd(
+        &[
+            "-G".to_string(),
+            "v4v6".to_string(),
+            format!("{}.", hostname.trim().trim_end_matches('.')),
+        ],
+        Duration::from_millis(900),
+    )
+    .await
+    .unwrap_or_default();
+    parse_dns_sd_address_lookup(&output)
+}
+
+fn parse_dns_sd_address_lookup(output: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    output
+        .split_whitespace()
+        .filter_map(|token| token.trim_end_matches('.').parse::<IpAddr>().ok())
+        .filter(|ip| !ip.is_loopback() && !ip.is_multicast() && !ip.is_unspecified())
+        .map(|ip| ip.to_string())
+        .filter(|ip| seen.insert(ip.clone()))
+        .collect()
+}
+
 fn trim_dns_sd_field(value: &str) -> String {
     value.trim().trim_end_matches('.').to_string()
 }
@@ -1157,6 +1201,39 @@ struct EndpointProbeResult {
     endpoint_id: String,
     reachability: Option<AvailabilityState>,
     ssh_capability: AvailabilityState,
+}
+
+#[derive(Debug)]
+struct ResolvedEndpointIps {
+    endpoint: NetworkEndpoint,
+    ip_addresses: Vec<String>,
+}
+
+async fn resolve_existing_endpoint_ips(endpoints: &[NetworkEndpoint]) -> Vec<ResolvedEndpointIps> {
+    let handles = endpoints
+        .iter()
+        .filter(|endpoint| matches!(endpoint.kind, EndpointKind::LanDns | EndpointKind::Mdns))
+        .filter(|endpoint| endpoint.address.parse::<IpAddr>().is_err())
+        .map(|endpoint| {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                let host = endpoint.host_for_connection().to_string();
+                let ip_addresses = resolve_mdns_ip_addresses(&host).await;
+                (!ip_addresses.is_empty()).then_some(ResolvedEndpointIps {
+                    endpoint,
+                    ip_addresses,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut resolved = Vec::new();
+    for handle in handles {
+        if let Ok(Some(result)) = handle.await {
+            resolved.push(result);
+        }
+    }
+    resolved
 }
 
 async fn probe_ssh_endpoints(endpoints: Vec<NetworkEndpoint>) -> Vec<EndpointProbeResult> {
@@ -1499,6 +1576,16 @@ mod tests {
         assert_eq!(
             parse_dns_sd_resolve(output),
             Some(("office-macbook.local".to_string(), 2222))
+        );
+    }
+
+    #[test]
+    fn parses_dns_sd_address_lookup_ips() {
+        let output = "DATE: ---Fri 19 Jun 2026---\n10:00:01.000  Add  3  14  office-macbook.local.  192.168.1.20  120\n10:00:01.001  Add  3  14  office-macbook.local.  fe80::1234:abcd  120\n10:00:01.002  Add  3  14  office-macbook.local.  224.0.0.251  120\n";
+
+        assert_eq!(
+            parse_dns_sd_address_lookup(output),
+            vec!["192.168.1.20".to_string(), "fe80::1234:abcd".to_string()]
         );
     }
 }

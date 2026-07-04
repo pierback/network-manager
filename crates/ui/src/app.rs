@@ -7,8 +7,9 @@ use gpui::{
 use network_manager_core::TrackedState;
 
 use crate::data::{
-    ActionOutcome, ActionStatus, DaemonActions, DaemonLifecycleAction, MockRepository,
-    NetworkManagerActions, NetworkManagerRepository, NoopActions, RefreshMode, SqliteRepository,
+    ActionOutcome, ActionStatus, DaemonActions, DaemonLifecycleAction, DashboardVm, DeviceDetailVm,
+    DiscoveryVm, MockRepository, NetworkManagerActions, NetworkManagerRepository, NoopActions,
+    QuickAccessVm, RefreshMode, SettingsVm, SqliteRepository,
 };
 use crate::hotkeys::{
     ActualSize, BringAllToFront, CloseWindow, Find, FindNext, FindPrevious, MinimizeWindow,
@@ -35,6 +36,14 @@ pub struct NetworkManagerApp {
     action_sequence: u64,
     tokens: LiquidGlassTokens,
     focus_handle: Option<FocusHandle>,
+}
+
+enum RouteViewModel {
+    Dashboard(DashboardVm),
+    Discovery(DiscoveryVm),
+    DeviceDetail(DeviceDetailVm),
+    QuickAccess(QuickAccessVm),
+    Settings(SettingsVm),
 }
 
 impl NetworkManagerApp {
@@ -320,6 +329,19 @@ impl NetworkManagerApp {
         self.record_action_result(result);
     }
 
+    fn view_model_for_route(&self, route: Route) -> RouteViewModel {
+        match route {
+            Route::Dashboard => RouteViewModel::Dashboard(self.repository.dashboard()),
+            Route::Discovery => RouteViewModel::Discovery(self.repository.discovery()),
+            Route::DeviceDetail => RouteViewModel::DeviceDetail(
+                self.repository
+                    .selected_device_detail(self.selected_device_id.as_deref()),
+            ),
+            Route::QuickAccess => RouteViewModel::QuickAccess(self.repository.quick_access()),
+            Route::Settings => RouteViewModel::Settings(self.repository.settings()),
+        }
+    }
+
     fn set_discovery_identity_state_inner(
         &mut self,
         identity_id: Option<String>,
@@ -570,33 +592,26 @@ impl Render for NetworkManagerApp {
 
         let tokens = self.tokens;
         let route = self.route;
-        let dashboard_vm = self.repository.dashboard();
-        let discovery_vm = self.repository.discovery();
-        let detail_vm = self
-            .repository
-            .selected_device_detail(self.selected_device_id.as_deref());
-        let quick_vm = self.repository.quick_access();
-        let settings_vm = self.repository.settings();
         let action_status = self.action_status.clone();
 
-        let content = match route {
-            Route::Dashboard => {
+        let content = match self.view_model_for_route(route) {
+            RouteViewModel::Dashboard(dashboard_vm) => {
                 dashboard::screen(&dashboard_vm, action_status.as_ref(), tokens, cx)
             }
-            Route::Discovery => discovery::screen(
+            RouteViewModel::Discovery(discovery_vm) => discovery::screen(
                 &discovery_vm,
                 self.selected_discovery_filter,
                 action_status.as_ref(),
                 tokens,
                 cx,
             ),
-            Route::DeviceDetail => {
+            RouteViewModel::DeviceDetail(detail_vm) => {
                 device_detail::screen(&detail_vm, action_status.as_ref(), tokens, cx)
             }
-            Route::QuickAccess => {
+            RouteViewModel::QuickAccess(quick_vm) => {
                 quick_access::screen(&quick_vm, action_status.as_ref(), tokens, cx)
             }
-            Route::Settings => settings::screen(
+            RouteViewModel::Settings(settings_vm) => settings::screen(
                 &settings_vm,
                 self.selected_settings_section,
                 action_status.as_ref(),
@@ -683,6 +698,44 @@ mod tests {
     struct RecordingActions {
         calls: Arc<Mutex<Vec<String>>>,
         fail: bool,
+    }
+
+    #[derive(Clone)]
+    struct CountingRepository {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl CountingRepository {
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl NetworkManagerRepository for CountingRepository {
+        fn dashboard(&self) -> DashboardVm {
+            self.record("dashboard");
+            MockRepository::new().dashboard()
+        }
+
+        fn discovery(&self) -> DiscoveryVm {
+            self.record("discovery");
+            MockRepository::new().discovery()
+        }
+
+        fn selected_device_detail(&self, selected_identity_id: Option<&str>) -> DeviceDetailVm {
+            self.record("detail");
+            MockRepository::new().selected_device_detail(selected_identity_id)
+        }
+
+        fn quick_access(&self) -> QuickAccessVm {
+            self.record("quick_access");
+            MockRepository::new().quick_access()
+        }
+
+        fn settings(&self) -> SettingsVm {
+            self.record("settings");
+            MockRepository::new().settings()
+        }
     }
 
     impl NetworkManagerActions for RecordingActions {
@@ -783,6 +836,26 @@ mod tests {
         for route in Route::ALL {
             app.select_route_for_test(route);
             assert_eq!(app.current_route(), route);
+        }
+    }
+
+    #[test]
+    fn route_view_model_loads_only_active_repository_model() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = NetworkManagerApp::new(CountingRepository {
+            calls: calls.clone(),
+        });
+
+        for (route, expected_call) in [
+            (Route::Dashboard, "dashboard"),
+            (Route::Discovery, "discovery"),
+            (Route::DeviceDetail, "detail"),
+            (Route::QuickAccess, "quick_access"),
+            (Route::Settings, "settings"),
+        ] {
+            calls.lock().unwrap().clear();
+            drop(app.view_model_for_route(route));
+            assert_eq!(calls.lock().unwrap().as_slice(), [expected_call]);
         }
     }
 

@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use network_manager_core::{
-    AvailabilityState, DeviceIdentity, DiscoveredDevice, EndpointPreference, NetworkEndpoint,
-    TrackedState,
+    AvailabilityState, DeviceIdentity, DiscoveredDevice, EndpointKind, EndpointPreference,
+    NetworkEndpoint, TrackedState,
 };
 use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -61,6 +61,7 @@ pub struct MdnsServiceObservation {
     pub service_type: String,
     pub domain: String,
     pub hostname: Option<String>,
+    pub ip_addresses: Vec<String>,
     pub port: Option<u16>,
     pub raw_text: String,
 }
@@ -761,10 +762,65 @@ impl SqliteStore {
                     "mdns",
                     "online",
                 )?;
+
+                for ip_address in observation
+                    .ip_addresses
+                    .iter()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                {
+                    self.conn.execute(
+                        "INSERT INTO identity_evidence(identity_id, discovered_device_id, evidence_type, evidence_value, confidence, source)
+                         VALUES (?1, ?2, 'ip_address', ?3, 0.65, 'mdns')",
+                        params![identity_id, discovered_id, ip_address],
+                    )?;
+                    self.upsert_endpoint(
+                        &identity_id,
+                        "lan_ip",
+                        ip_address,
+                        if observation.service_type == "_ssh._tcp" {
+                            observation.port
+                        } else {
+                            None
+                        },
+                        None,
+                        "mdns",
+                        "online",
+                    )?;
+                }
             }
         }
 
         Ok(observations.len())
+    }
+
+    pub fn record_resolved_endpoint_ips(
+        &self,
+        endpoint: &NetworkEndpoint,
+        ip_addresses: &[String],
+    ) -> Result<usize> {
+        if !matches!(endpoint.kind, EndpointKind::LanDns | EndpointKind::Mdns) {
+            return Ok(0);
+        }
+
+        let mut changed = 0;
+        for ip_address in ip_addresses
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            self.upsert_endpoint(
+                &endpoint.identity_id,
+                "lan_ip",
+                ip_address,
+                endpoint.port,
+                None,
+                "mdns",
+                "online",
+            )?;
+            changed += 1;
+        }
+        Ok(changed)
     }
 
     pub fn device_identity_record(
@@ -2250,6 +2306,7 @@ mod tests {
                 service_type: "_ssh._tcp".to_string(),
                 domain: "local".to_string(),
                 hostname: Some("office-mac.local".to_string()),
+                ip_addresses: Vec::new(),
                 port: Some(22),
                 raw_text: "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
                     .to_string(),
@@ -2268,6 +2325,84 @@ mod tests {
     }
 
     #[test]
+    fn records_mdns_resolved_ips_on_same_identity() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+
+        store
+            .record_mdns_services(&[MdnsServiceObservation {
+                source_device_id: "local.:_ssh._tcp.:Office Mac".to_string(),
+                service_name: "Office Mac".to_string(),
+                service_type: "_ssh._tcp".to_string(),
+                domain: "local".to_string(),
+                hostname: Some("office-mac.local".to_string()),
+                ip_addresses: vec!["192.168.1.10".to_string()],
+                port: Some(22),
+                raw_text: "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
+                    .to_string(),
+            }])
+            .unwrap();
+
+        let identities = store.list_device_identities().unwrap();
+        assert_eq!(identities.len(), 1);
+        let endpoints = store
+            .endpoints_for_identity(&identities[0].identity.id)
+            .unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.kind == EndpointKind::Mdns
+                && endpoint.address == "office-mac.local"
+                && endpoint.port == Some(22)
+        }));
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.kind == EndpointKind::LanIp
+                && endpoint.address == "192.168.1.10"
+                && endpoint.port == Some(22)
+        }));
+    }
+
+    #[test]
+    fn records_existing_dns_endpoint_resolved_ips_on_same_identity() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+
+        store
+            .record_mdns_services(&[MdnsServiceObservation {
+                source_device_id: "local.:_ssh._tcp.:Office Mac".to_string(),
+                service_name: "Office Mac".to_string(),
+                service_type: "_ssh._tcp".to_string(),
+                domain: "local".to_string(),
+                hostname: Some("office-mac.local".to_string()),
+                ip_addresses: Vec::new(),
+                port: Some(22),
+                raw_text: "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
+                    .to_string(),
+            }])
+            .unwrap();
+
+        let identity_id = store.list_device_identities().unwrap()[0]
+            .identity
+            .id
+            .clone();
+        let mdns_endpoint = store.endpoints_for_identity(&identity_id).unwrap()[0].clone();
+        let changed = store
+            .record_resolved_endpoint_ips(&mdns_endpoint, &["192.168.1.20".to_string()])
+            .unwrap();
+
+        assert_eq!(changed, 1);
+        let endpoints = store.endpoints_for_identity(&identity_id).unwrap();
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.kind == EndpointKind::LanIp
+                && endpoint.address == "192.168.1.20"
+                && endpoint.port == Some(22)
+        }));
+    }
+
+    #[test]
     fn records_non_ssh_mdns_services_as_online_device_endpoints() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("test.sqlite");
@@ -2281,6 +2416,7 @@ mod tests {
                 service_type: "_workstation._tcp".to_string(),
                 domain: "local".to_string(),
                 hostname: Some("homeassistant.local".to_string()),
+                ip_addresses: Vec::new(),
                 port: None,
                 raw_text:
                     "homeassistant._workstation._tcp.local. can be reached at homeassistant.local."
@@ -2318,6 +2454,7 @@ mod tests {
                 service_type: "_ssh._tcp".to_string(),
                 domain: "local".to_string(),
                 hostname: None,
+                ip_addresses: Vec::new(),
                 port: None,
                 raw_text: "Office Mac._ssh._tcp.local.".to_string(),
             }])
@@ -2336,6 +2473,7 @@ mod tests {
                 service_type: "_ssh._tcp".to_string(),
                 domain: "local".to_string(),
                 hostname: Some("office-mac.local".to_string()),
+                ip_addresses: Vec::new(),
                 port: Some(22),
                 raw_text: "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
                     .to_string(),

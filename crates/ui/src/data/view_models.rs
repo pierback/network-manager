@@ -91,6 +91,8 @@ pub struct EndpointVm {
     pub group: EndpointGroup,
     pub kind: EndpointKind,
     pub address: String,
+    pub hostname: Option<String>,
+    pub port: Option<u16>,
     pub reachability: AvailabilityState,
     pub ssh_capability: AvailabilityState,
     pub last_checked: String,
