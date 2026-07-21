@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use network_manager_core::{
-    resolve_ssh_target, AvailabilityState, EndpointKind, EndpointPreference, SshTarget,
-    TrackedState,
+    format_shell_command, resolve_ssh_target, AvailabilityState, EndpointKind, EndpointPreference,
+    SshTarget, TrackedState,
 };
 use network_manager_db::{
     DeviceMutationResult, IdentityCorrectionResult, IdentityLookup, SqliteStore, UserSettingsExport,
@@ -66,11 +66,6 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// Device identity commands.
-    Devices {
-        #[command(subcommand)]
-        command: DevicesCommand,
-    },
     /// List known device identities.
     List(DeviceListArgs),
     /// Show one device identity with endpoints.
@@ -85,6 +80,12 @@ enum Command {
     Label(LabelArgs),
     /// Set the CLI-friendly unique alias.
     Alias(AliasArgs),
+    /// Set or clear the device SSH username.
+    SshUser(SshUserArgs),
+    /// Set or clear the device SSH port.
+    SshPort(SshPortArgs),
+    /// Set endpoint preference for SSH resolution.
+    Preference(PreferenceArgs),
     /// Set or clear the device category.
     Category(CategoryArgs),
     /// Add a tag to a device.
@@ -184,40 +185,6 @@ struct DaemonInstallArgs {
 struct DaemonLabelArgs {
     #[arg(long)]
     label: Option<String>,
-}
-
-#[derive(Debug, Subcommand)]
-enum DevicesCommand {
-    /// List known device identities.
-    List(DeviceListArgs),
-    /// Show one device identity with endpoints.
-    Show(DeviceQueryArgs),
-    /// Mark a discovered identity as tracked/favorite.
-    Track(TrackArgs),
-    /// Mark a device identity as untracked.
-    Untrack(DeviceQueryArgs),
-    /// Ignore a noisy device identity.
-    Ignore(DeviceQueryArgs),
-    /// Set the human-facing label.
-    Label(LabelArgs),
-    /// Set the CLI-friendly unique alias.
-    Alias(AliasArgs),
-    /// Set or clear the device SSH username.
-    SshUser(SshUserArgs),
-    /// Set or clear the device SSH port.
-    SshPort(SshPortArgs),
-    /// Set endpoint preference for SSH resolution.
-    Preference(PreferenceArgs),
-    /// Set or clear the device category.
-    Category(CategoryArgs),
-    /// Add a tag to a device.
-    Tag(TagArgs),
-    /// Remove a tag from a device.
-    Untag(TagArgs),
-    /// Merge one identity into another.
-    Merge(MergeArgs),
-    /// Split one discovered device into a separate identity.
-    Split(SplitArgs),
 }
 
 #[derive(Debug, Args)]
@@ -407,8 +374,8 @@ struct SshArgs {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliPreference {
     Auto,
-    LocalFirst,
     TailscaleFirst,
+    #[value(alias = "local-first")]
     LanFirst,
 }
 
@@ -416,7 +383,6 @@ impl CliPreference {
     fn as_core(self) -> EndpointPreference {
         match self {
             Self::Auto => EndpointPreference::Auto,
-            Self::LocalFirst => EndpointPreference::LocalFirst,
             Self::TailscaleFirst => EndpointPreference::TailscaleFirst,
             Self::LanFirst => EndpointPreference::LanFirst,
         }
@@ -611,221 +577,7 @@ async fn run() -> Result<()> {
                 PathKind::Socket => print_value(&paths.socket.display().to_string(), cli.json),
             }?;
         }
-        Command::Daemon { command } => match command {
-            DaemonCommand::Status => {
-                let status = daemon_status(&cli, &paths).await?;
-                print_struct(&status, cli.json)?;
-            }
-            DaemonCommand::Plist(args) => {
-                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
-                let daemon_path = canonical_daemon_path(
-                    &args
-                        .daemon_path
-                        .clone()
-                        .unwrap_or_else(default_daemon_binary_path),
-                )?;
-                let plist = launch_agent_plist(
-                    label,
-                    &daemon_path,
-                    &paths,
-                    args.refresh_interval_seconds,
-                    args.disable_auto_refresh,
-                )?;
-                let output = DaemonPlistOutput {
-                    label: label.to_string(),
-                    daemon_path: daemon_path.display().to_string(),
-                    db_path: paths.db.display().to_string(),
-                    socket_path: paths.socket.display().to_string(),
-                    plist,
-                };
-                if cli.json {
-                    print_struct(&output, true)?;
-                } else {
-                    println!("{}", output.plist);
-                }
-            }
-            DaemonCommand::Install(args) => {
-                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
-                let daemon_path = canonical_daemon_path(
-                    &args
-                        .daemon_path
-                        .clone()
-                        .unwrap_or_else(default_daemon_binary_path),
-                )?;
-                let plist_path = install_launch_agent(
-                    label,
-                    &daemon_path,
-                    &paths,
-                    args.refresh_interval_seconds,
-                    args.disable_auto_refresh,
-                    args.force,
-                )?;
-                let mut message = format!("installed {}", plist_path.display());
-                if args.load {
-                    launchctl_bootstrap(label)?;
-                    message = format!("{message}; started {label}");
-                }
-                print_daemon_action("install", label, Some(&plist_path), &message, cli.json)?;
-            }
-            DaemonCommand::Uninstall(args) => {
-                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
-                validate_launch_agent_label(label)?;
-                launchctl_bootout(label).ok();
-                let path = launch_agent_path(label);
-                let message = if path.exists() {
-                    std::fs::remove_file(&path)?;
-                    format!("removed {}", path.display())
-                } else {
-                    format!("{} was not installed", path.display())
-                };
-                print_daemon_action("uninstall", label, Some(&path), &message, cli.json)?;
-            }
-            DaemonCommand::Start(args) => {
-                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
-                launchctl_bootstrap(label)?;
-                print_daemon_action(
-                    "start",
-                    label,
-                    Some(&launch_agent_path(label)),
-                    &format!("started {label}"),
-                    cli.json,
-                )?;
-            }
-            DaemonCommand::Restart(args) => {
-                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
-                restart_launch_agent(label)?;
-                print_daemon_action(
-                    "restart",
-                    label,
-                    Some(&launch_agent_path(label)),
-                    &format!("restarted {label}"),
-                    cli.json,
-                )?;
-            }
-            DaemonCommand::Stop(args) => {
-                let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
-                launchctl_bootout(label)?;
-                print_daemon_action(
-                    "stop",
-                    label,
-                    Some(&launch_agent_path(label)),
-                    &format!("stopped {label}"),
-                    cli.json,
-                )?;
-            }
-        },
-        Command::Devices { command } => match command {
-            DevicesCommand::List(args) => {
-                let devices = list_devices(&cli, &paths, args).await?;
-                print_struct(&devices, cli.json)?;
-            }
-            DevicesCommand::Show(args) => {
-                let details = show_device(&cli, &paths, &args.device).await?;
-                print_struct(&details, cli.json)?;
-            }
-            DevicesCommand::Track(args) => {
-                let result = mutate_tracked_state(
-                    &cli,
-                    &paths,
-                    &args.device,
-                    TrackedState::Tracked,
-                    args.label.as_deref(),
-                    args.alias.as_deref(),
-                )
-                .await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Untrack(args) => {
-                let result = mutate_tracked_state(
-                    &cli,
-                    &paths,
-                    &args.device,
-                    TrackedState::Untracked,
-                    None,
-                    None,
-                )
-                .await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Ignore(args) => {
-                let result = mutate_tracked_state(
-                    &cli,
-                    &paths,
-                    &args.device,
-                    TrackedState::Ignored,
-                    None,
-                    None,
-                )
-                .await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Label(args) => {
-                let result = set_label(&cli, &paths, &args.device, &args.label).await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Alias(args) => {
-                let result = set_alias(&cli, &paths, &args.device, &args.alias).await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Category(args) => {
-                let result = set_category(
-                    &cli,
-                    &paths,
-                    &args.device,
-                    args.category.as_deref(),
-                    args.clear,
-                )
-                .await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Tag(args) => {
-                let result = add_tag(&cli, &paths, &args.device, &args.tag).await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Untag(args) => {
-                let result = remove_tag(&cli, &paths, &args.device, &args.tag).await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::SshUser(args) => {
-                let result = set_ssh_username(
-                    &cli,
-                    &paths,
-                    &args.device,
-                    args.username.as_deref(),
-                    args.clear,
-                )
-                .await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::SshPort(args) => {
-                let result =
-                    set_ssh_port(&cli, &paths, &args.device, args.port, args.clear).await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Preference(args) => {
-                let result =
-                    set_endpoint_preference(&cli, &paths, &args.device, args.preference.as_core())
-                        .await?;
-                print_mutation(result, cli.json)?;
-            }
-            DevicesCommand::Merge(args) => {
-                let result = merge_identities(
-                    &cli,
-                    &paths,
-                    &args.source,
-                    &args.target,
-                    args.reason.as_deref(),
-                )
-                .await?;
-                print_correction(result, cli.json)?;
-            }
-            DevicesCommand::Split(args) => {
-                let result =
-                    split_discovered(&cli, &paths, &args.discovered_id, args.reason.as_deref())
-                        .await?;
-                print_correction(result, cli.json)?;
-            }
-        },
+        Command::Daemon { command } => run_daemon_command(&cli, &paths, command).await?,
         Command::List(args) => {
             let devices = list_devices(&cli, &paths, args).await?;
             print_struct(&devices, cli.json)?;
@@ -878,6 +630,27 @@ async fn run() -> Result<()> {
             let result = set_alias(&cli, &paths, &args.device, &args.alias).await?;
             print_mutation(result, cli.json)?;
         }
+        Command::SshUser(args) => {
+            let result = set_ssh_username(
+                &cli,
+                &paths,
+                &args.device,
+                args.username.as_deref(),
+                args.clear,
+            )
+            .await?;
+            print_mutation(result, cli.json)?;
+        }
+        Command::SshPort(args) => {
+            let result = set_ssh_port(&cli, &paths, &args.device, args.port, args.clear).await?;
+            print_mutation(result, cli.json)?;
+        }
+        Command::Preference(args) => {
+            let result =
+                set_endpoint_preference(&cli, &paths, &args.device, args.preference.as_core())
+                    .await?;
+            print_mutation(result, cli.json)?;
+        }
         Command::Category(args) => {
             let result = set_category(
                 &cli,
@@ -925,7 +698,7 @@ async fn run() -> Result<()> {
                 print_struct(&resolved, true)?;
             } else if args.ssh_command {
                 ensure_resolved(&resolved)?;
-                println!("ssh {}", resolved.ssh_args.join(" "));
+                println!("{}", format_shell_command("ssh", &resolved.ssh_args));
             } else {
                 ensure_resolved(&resolved)?;
                 let destination = ssh_destination(&resolved);
@@ -978,6 +751,114 @@ async fn run() -> Result<()> {
             let resolved = resolve(&cli, &paths, &args.device, args.preference.as_core()).await?;
             ensure_resolved(&resolved)?;
             exec_ssh(&resolved.ssh_args, &args.ssh_args)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_daemon_command(cli: &Cli, paths: &Paths, command: &DaemonCommand) -> Result<()> {
+    match command {
+        DaemonCommand::Status => {
+            let status = daemon_status(cli, paths).await?;
+            print_struct(&status, cli.json)?;
+        }
+        DaemonCommand::Plist(args) => {
+            let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+            let daemon_path = canonical_daemon_path(
+                &args
+                    .daemon_path
+                    .clone()
+                    .unwrap_or_else(default_daemon_binary_path),
+            )?;
+            let plist = launch_agent_plist(
+                label,
+                &daemon_path,
+                paths,
+                args.refresh_interval_seconds,
+                args.disable_auto_refresh,
+            )?;
+            let output = DaemonPlistOutput {
+                label: label.to_string(),
+                daemon_path: daemon_path.display().to_string(),
+                db_path: paths.db.display().to_string(),
+                socket_path: paths.socket.display().to_string(),
+                plist,
+            };
+            if cli.json {
+                print_struct(&output, true)?;
+            } else {
+                println!("{}", output.plist);
+            }
+        }
+        DaemonCommand::Install(args) => {
+            let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+            let daemon_path = canonical_daemon_path(
+                &args
+                    .daemon_path
+                    .clone()
+                    .unwrap_or_else(default_daemon_binary_path),
+            )?;
+            let plist_path = install_launch_agent(
+                label,
+                &daemon_path,
+                paths,
+                args.refresh_interval_seconds,
+                args.disable_auto_refresh,
+                args.force,
+            )?;
+            let mut message = format!("installed {}", plist_path.display());
+            if args.load {
+                launchctl_bootstrap(label)?;
+                message = format!("{message}; started {label}");
+            }
+            print_daemon_action("install", label, Some(&plist_path), &message, cli.json)?;
+        }
+        DaemonCommand::Uninstall(args) => {
+            let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+            validate_launch_agent_label(label)?;
+            launchctl_bootout(label).ok();
+            let path = launch_agent_path(label);
+            let message = if path.exists() {
+                std::fs::remove_file(&path)?;
+                format!("removed {}", path.display())
+            } else {
+                format!("{} was not installed", path.display())
+            };
+            print_daemon_action("uninstall", label, Some(&path), &message, cli.json)?;
+        }
+        DaemonCommand::Start(args) => {
+            let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+            launchctl_bootstrap(label)?;
+            print_daemon_action(
+                "start",
+                label,
+                Some(&launch_agent_path(label)),
+                &format!("started {label}"),
+                cli.json,
+            )?;
+        }
+        DaemonCommand::Restart(args) => {
+            let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+            restart_launch_agent(label)?;
+            print_daemon_action(
+                "restart",
+                label,
+                Some(&launch_agent_path(label)),
+                &format!("restarted {label}"),
+                cli.json,
+            )?;
+        }
+        DaemonCommand::Stop(args) => {
+            let label = args.label.as_deref().unwrap_or(DEFAULT_LAUNCH_AGENT_LABEL);
+            launchctl_bootout(label)?;
+            print_daemon_action(
+                "stop",
+                label,
+                Some(&launch_agent_path(label)),
+                &format!("stopped {label}"),
+                cli.json,
+            )?;
         }
     }
 
@@ -2667,6 +2548,35 @@ fn exec_ssh(base_args: &[String], extra_args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_level_device_mutation_commands_parse() {
+        let commands: &[&[&str]] = &[
+            &["network-manager", "track", "device", "--alias", "alias"],
+            &["network-manager", "untrack", "device"],
+            &["network-manager", "ignore", "device"],
+            &["network-manager", "label", "device", "Device Label"],
+            &["network-manager", "alias", "device", "device-alias"],
+            &["network-manager", "ssh-user", "device", "alice"],
+            &["network-manager", "ssh-port", "device", "2222"],
+            &["network-manager", "preference", "device", "local-first"],
+            &["network-manager", "category", "device", "workstation"],
+            &["network-manager", "tag", "device", "office"],
+            &["network-manager", "untag", "device", "office"],
+            &["network-manager", "merge", "source", "target"],
+            &["network-manager", "split", "discovered-device"],
+        ];
+
+        for args in commands {
+            Cli::try_parse_from(args.iter().copied())
+                .unwrap_or_else(|error| panic!("failed to parse {}: {error}", args.join(" ")));
+        }
+    }
+
+    #[test]
+    fn nested_devices_command_is_not_part_of_the_grammar() {
+        assert!(Cli::try_parse_from(["network-manager", "devices", "list"]).is_err());
+    }
 
     #[test]
     fn daemon_restart_command_parses() {

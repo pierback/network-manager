@@ -7,7 +7,7 @@ use std::{
 
 use network_manager_core::{
     resolve_ssh_target, AvailabilityState, DeviceIdentity, EndpointKind, EndpointPreference,
-    NetworkEndpoint, TrackedState,
+    NetworkEndpoint, SshTarget, TrackedState,
 };
 use network_manager_db::{DeviceDetails, DiscoveredDeviceRecord, SqliteStore};
 
@@ -86,11 +86,7 @@ impl NetworkManagerRepository for SqliteRepository {
 
     fn discovery(&self) -> DiscoveryVm {
         let Ok(store) = self.store() else {
-            return DiscoveryVm {
-                rows: Vec::new(),
-                filters: default_filters(),
-                possible_match: Some("SQLite store unavailable".into()),
-            };
+            return DiscoveryVm { rows: Vec::new() };
         };
         let identities_by_id = store
             .list_device_identities()
@@ -115,11 +111,7 @@ impl NetworkManagerRepository for SqliteRepository {
                 })
                 .collect(),
         );
-        DiscoveryVm {
-            rows,
-            filters: default_filters(),
-            possible_match: None,
-        }
+        DiscoveryVm { rows }
     }
 
     fn selected_device_detail(&self, selected_identity_id: Option<&str>) -> DeviceDetailVm {
@@ -181,15 +173,7 @@ impl NetworkManagerRepository for SqliteRepository {
             .store()
             .map(|store| daemon_vm(&store))
             .unwrap_or_else(|_| daemon_status("sqlite unavailable"));
-        SettingsVm {
-            daemon: daemon.clone(),
-            discovery_interval: "Daemon managed".into(),
-            battery_mode: true,
-            tailscale_enabled: true,
-            tailscale_status: daemon.tailscale_service,
-            ssh_config_export: false,
-            debug_logging: false,
-        }
+        SettingsVm { daemon }
     }
 }
 
@@ -278,16 +262,6 @@ fn empty_dashboard(source: &str) -> DashboardVm {
     }
 }
 
-fn default_filters() -> Vec<String> {
-    vec![
-        "All sources".into(),
-        "LAN".into(),
-        "Tailscale".into(),
-        "SSH capable".into(),
-        "Untracked".into(),
-    ]
-}
-
 fn endpoints_by_identity(
     store: &SqliteStore,
 ) -> anyhow::Result<HashMap<String, Vec<NetworkEndpoint>>> {
@@ -313,7 +287,7 @@ fn tracked_row_from_parts(
     );
     let preferred = target
         .as_ref()
-        .map(|target| ssh_destination(target.username.as_deref(), &target.host, target.port))
+        .map(SshTarget::destination)
         .unwrap_or_else(|| "No SSH capability".into());
     let target_reason = target
         .as_ref()
@@ -458,7 +432,7 @@ fn merge_discovery_row(existing: &mut DiscoveryRowVm, incoming: DiscoveryRowVm) 
         }
     }
     existing.availability =
-        aggregate_state([existing.availability, incoming.availability].into_iter());
+        AvailabilityState::aggregate([existing.availability, incoming.availability]);
     existing.ssh_capable |= incoming.ssh_capable;
     existing.tracked_state = merge_tracked_state(existing.tracked_state, incoming.tracked_state);
     if existing.identity_id.is_none() {
@@ -570,10 +544,7 @@ fn device_detail(details: DeviceDetails, device_list: Vec<DeviceIdentityVm>) -> 
                     .is_some_and(|id| id == endpoint.id),
             })
             .collect(),
-        preferred_target: target.map(|target| SshTargetVm {
-            destination: ssh_destination(target.username.as_deref(), &target.host, target.port),
-            reason: format!("Selected {} endpoint", target.endpoint_kind.as_str()),
-        }),
+        preferred_target: target.map(ssh_target_vm),
         evidence: vec![format!("Stable key: {}", identity.stable_key)],
     }
 }
@@ -836,7 +807,7 @@ fn aggregate_reachability(
     endpoints: &[NetworkEndpoint],
     predicate: impl Fn(EndpointKind) -> bool,
 ) -> AvailabilityState {
-    aggregate_state(
+    AvailabilityState::aggregate(
         endpoints
             .iter()
             .filter(|endpoint| predicate(endpoint.kind))
@@ -845,23 +816,7 @@ fn aggregate_reachability(
 }
 
 fn aggregate_ssh(endpoints: &[NetworkEndpoint]) -> AvailabilityState {
-    aggregate_state(endpoints.iter().map(|endpoint| endpoint.ssh_capability))
-}
-
-fn aggregate_state(states: impl Iterator<Item = AvailabilityState>) -> AvailabilityState {
-    let mut saw_offline = false;
-    for state in states {
-        match state {
-            AvailabilityState::Online => return AvailabilityState::Online,
-            AvailabilityState::Offline => saw_offline = true,
-            AvailabilityState::Unknown => {}
-        }
-    }
-    if saw_offline {
-        AvailabilityState::Offline
-    } else {
-        AvailabilityState::Unknown
-    }
+    AvailabilityState::aggregate(endpoints.iter().map(|endpoint| endpoint.ssh_capability))
 }
 
 fn parse_availability(value: &str) -> AvailabilityState {
@@ -889,14 +844,11 @@ fn identity_label(identity: &DeviceIdentity) -> String {
         .unwrap_or_else(|| identity.stable_key.clone())
 }
 
-fn ssh_destination(username: Option<&str>, host: &str, port: u16) -> String {
-    let destination = username
-        .map(|username| format!("{username}@{host}"))
-        .unwrap_or_else(|| host.to_string());
-    if port == 22 {
-        destination
-    } else {
-        format!("{destination}:{port}")
+fn ssh_target_vm(target: SshTarget) -> SshTargetVm {
+    SshTargetVm {
+        destination: target.destination(),
+        command: target.shell_command(),
+        reason: format!("Selected {} endpoint", target.endpoint_kind.as_str()),
     }
 }
 
@@ -937,6 +889,20 @@ mod tests {
             ssh_capable: false,
             last_seen: "now".into(),
         }
+    }
+
+    #[test]
+    fn ssh_target_vm_uses_core_command_args_for_nondefault_port() {
+        let target = ssh_target_vm(SshTarget {
+            endpoint_id: "endpoint".into(),
+            host: "device.local".into(),
+            port: 2222,
+            username: Some("alice".into()),
+            endpoint_kind: EndpointKind::LanDns,
+        });
+
+        assert_eq!(target.destination, "alice@device.local");
+        assert_eq!(target.command, "ssh -p 2222 alice@device.local");
     }
 
     #[test]

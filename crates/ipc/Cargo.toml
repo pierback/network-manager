@@ -9,7 +9,6 @@ authors.workspace = true
 anyhow.workspace = true
 http.workspace = true
 hyper-util.workspace = true
-network-manager-core = { path = "../core" }
 prost.workspace = true
 tokio.workspace = true
 tonic.workspace = true

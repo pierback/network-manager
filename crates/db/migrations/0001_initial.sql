@@ -102,6 +102,7 @@ CREATE INDEX IF NOT EXISTS idx_device_user_intent_state ON device_user_intent(tr
 CREATE INDEX IF NOT EXISTS idx_discovered_devices_source ON discovered_devices(source, source_device_id);
 CREATE INDEX IF NOT EXISTS idx_observations_identity ON discovery_observations(identity_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_observations_device ON discovery_observations(discovered_device_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_observations_source_time ON discovery_observations(source, observed_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_endpoints_unique ON network_endpoints(identity_id, kind, address, COALESCE(port, 0));
 CREATE INDEX IF NOT EXISTS idx_endpoints_identity ON network_endpoints(identity_id);
 CREATE INDEX IF NOT EXISTS idx_endpoints_kind ON network_endpoints(kind);

@@ -1,5 +1,5 @@
-pub mod dashboard;
-pub mod device_detail;
-pub mod discovery;
-pub mod quick_access;
-pub mod settings;
+pub(crate) mod dashboard;
+pub(crate) mod device_detail;
+pub(crate) mod discovery;
+pub(crate) mod quick_access;
+pub(crate) mod settings;

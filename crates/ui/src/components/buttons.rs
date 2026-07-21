@@ -3,15 +3,7 @@ use gpui::{div, prelude::*, px, Div, FontWeight};
 use crate::components::icons::{self, Icon};
 use crate::theme::LiquidGlassTokens;
 
-pub fn toolbar_button(label: &str, tokens: LiquidGlassTokens) -> Div {
-    toolbar_button_base(label, None, tokens)
-}
-
 pub fn toolbar_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) -> Div {
-    toolbar_button_base(label, Some(icon), tokens)
-}
-
-fn toolbar_button_base(label: &str, icon: Option<Icon>, tokens: LiquidGlassTokens) -> Div {
     div()
         .flex()
         .items_center()
@@ -27,24 +19,8 @@ fn toolbar_button_base(label: &str, icon: Option<Icon>, tokens: LiquidGlassToken
         .text_size(px(12.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(tokens.colors.text)
-        .when_some(icon, |this, icon| {
-            this.child(icons::icon(icon, 14.0, tokens.colors.text_secondary))
-        })
+        .child(icons::icon(icon, 14.0, tokens.colors.text_secondary))
         .child(label.to_string())
-}
-
-pub fn icon_button(icon: Icon, tokens: LiquidGlassTokens) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(30.0))
-        .h(px(30.0))
-        .rounded(px(10.0))
-        .bg(gpui::rgba(0xffffff0a))
-        .hover(|style| style.bg(tokens.colors.selected))
-        .cursor_pointer()
-        .child(icons::icon(icon, 15.0, tokens.colors.text_secondary))
 }
 
 pub fn small_icon_button(icon: Icon, accent: bool, tokens: LiquidGlassTokens) -> Div {
@@ -69,18 +45,6 @@ pub fn small_icon_button(icon: Icon, accent: bool, tokens: LiquidGlassTokens) ->
         ))
 }
 
-pub fn disabled_small_icon_button(icon: Icon, tokens: LiquidGlassTokens) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(28.0))
-        .h(px(28.0))
-        .rounded(px(10.0))
-        .bg(gpui::rgba(0xffffff08))
-        .child(icons::icon(icon, 14.0, tokens.colors.text_muted))
-}
-
 pub fn action_button(label: &str, tokens: LiquidGlassTokens) -> Div {
     action_button_base(label, None, false, tokens)
 }
@@ -89,12 +53,26 @@ pub fn action_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) ->
     action_button_base(label, Some(icon), false, tokens)
 }
 
-pub fn accent_button(label: &str, tokens: LiquidGlassTokens) -> Div {
-    action_button_base(label, None, true, tokens)
-}
-
 pub fn accent_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) -> Div {
     action_button_base(label, Some(icon), true, tokens)
+}
+
+pub fn disabled_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(6.0))
+        .px(px(9.0))
+        .py(px(6.0))
+        .rounded(px(10.0))
+        .bg(gpui::rgba(0xffffff0a))
+        .font_family("Geist")
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(tokens.colors.text_secondary)
+        .child(icons::icon(icon, 13.0, tokens.colors.text_secondary))
+        .child(label.to_string())
 }
 
 fn action_button_base(
@@ -128,33 +106,5 @@ fn action_button_base(
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(fg)
         .when_some(icon, |this, icon| this.child(icons::icon(icon, 13.0, fg)))
-        .child(label.to_string())
-}
-
-pub fn disabled_button(label: &str, tokens: LiquidGlassTokens) -> Div {
-    disabled_button_base(label, None, tokens)
-}
-
-pub fn disabled_icon_button(label: &str, icon: Icon, tokens: LiquidGlassTokens) -> Div {
-    disabled_button_base(label, Some(icon), tokens)
-}
-
-fn disabled_button_base(label: &str, icon: Option<Icon>, tokens: LiquidGlassTokens) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .gap(px(6.0))
-        .px(px(9.0))
-        .py(px(6.0))
-        .rounded(px(10.0))
-        .bg(gpui::rgba(0xffffff0a))
-        .font_family("Geist")
-        .text_size(px(11.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(tokens.colors.text_secondary)
-        .when_some(icon, |this, icon| {
-            this.child(icons::icon(icon, 13.0, tokens.colors.text_secondary))
-        })
         .child(label.to_string())
 }

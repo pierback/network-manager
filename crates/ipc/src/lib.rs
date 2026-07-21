@@ -10,6 +10,10 @@ pub mod pb {
 }
 
 pub fn default_socket_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("NETWORK_MANAGER_SOCKET").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "unknown".to_string());

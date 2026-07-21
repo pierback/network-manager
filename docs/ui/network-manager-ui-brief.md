@@ -1,5 +1,11 @@
 # Network Manager UI Design Brief
 
+> Historical design input, not the current implementation contract. The runtime UI intentionally
+> exposes only working controls. Discovery search/match suggestions, inline identity editing,
+> merge/split controls, and cadence/battery/privacy/SSH-export settings remain deferred; identity
+> editing and corrections are available through the CLI. Do not add placeholder controls for these
+> ideas before their behavior exists end to end.
+
 Create a native-feeling macOS desktop app design for Network Manager, a local app that helps the user identify devices observable from the Mac, select the devices they care about, and quickly resolve/SSH into them.
 
 ## Product shape

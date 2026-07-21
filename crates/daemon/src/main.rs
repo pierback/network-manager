@@ -65,6 +65,212 @@ struct DaemonService {
     refresh_lock: Arc<AsyncMutex<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshMode {
+    Quick,
+    Full,
+}
+
+impl RefreshMode {
+    fn parse(value: &str) -> std::result::Result<Self, &'static str> {
+        match value {
+            "" | "quick" => Ok(Self::Quick),
+            "full" => Ok(Self::Full),
+            _ => Err("refresh mode must be 'quick' or 'full'"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum EndpointProbeScope {
+    All { tracked_only: bool },
+    Identity(String),
+}
+
+impl EndpointProbeScope {
+    fn load(&self, store: &SqliteStore) -> Result<Vec<NetworkEndpoint>> {
+        match self {
+            Self::All { tracked_only } => store.list_endpoints_for_probe(*tracked_only),
+            Self::Identity(identity_id) => store.endpoints_for_active_identity(identity_id),
+        }
+    }
+
+    fn is_targeted(&self) -> bool {
+        matches!(self, Self::Identity(_))
+    }
+}
+
+struct RefreshSources {
+    tailscale: Result<TailscaleSnapshot>,
+    active_lan: Option<Result<Vec<Ipv4Addr>>>,
+    mdns: Result<Vec<MdnsServiceObservation>>,
+    lan: Result<Vec<LanDeviceObservation>>,
+}
+
+struct RecordedRefresh {
+    accepted: bool,
+    messages: Vec<String>,
+    freshly_resolved_hosts: HashSet<String>,
+}
+
+async fn collect_refresh_sources(mode: RefreshMode) -> RefreshSources {
+    if mode == RefreshMode::Full {
+        let (tailscale, active_lan, mdns, lan) = tokio::join!(
+            refresh_tailscale(),
+            active_lan_probe(),
+            refresh_mdns_services(),
+            refresh_lan_arp(),
+        );
+        RefreshSources {
+            tailscale,
+            active_lan: Some(active_lan),
+            mdns,
+            lan,
+        }
+    } else {
+        let (tailscale, mdns, lan) = tokio::join!(
+            refresh_tailscale(),
+            refresh_mdns_services(),
+            refresh_lan_arp(),
+        );
+        RefreshSources {
+            tailscale,
+            active_lan: None,
+            mdns,
+            lan,
+        }
+    }
+}
+
+fn record_refresh_sources(
+    store: &SqliteStore,
+    mode: RefreshMode,
+    sources: RefreshSources,
+) -> Result<RecordedRefresh> {
+    store.set_daemon_heartbeat()?;
+    let mut accepted = false;
+    let mut messages = Vec::new();
+    let mut freshly_resolved_hosts = HashSet::new();
+
+    match sources.tailscale {
+        Ok(snapshot) => {
+            store.set_metadata("tailscale_service_state", &snapshot.backend_state)?;
+            let count =
+                store.record_tailscale_nodes(snapshot.tailnet.as_deref(), &snapshot.nodes)?;
+            accepted = true;
+            messages.push(format!("recorded {count} Tailscale device(s)"));
+        }
+        Err(error) => {
+            store.set_metadata("tailscale_service_state", "unavailable")?;
+            messages.push(format!("Tailscale unavailable: {error}"));
+        }
+    }
+
+    let active_lan_ips = match sources.active_lan {
+        Some(Ok(ips)) => {
+            messages.push(format!("probed {} LAN address(es)", ips.len()));
+            ips
+        }
+        Some(Err(error)) => {
+            messages.push(format!("active LAN probe unavailable: {error}"));
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+
+    match sources.mdns {
+        Ok(observations) => {
+            freshly_resolved_hosts.extend(
+                observations
+                    .iter()
+                    .filter(|observation| !observation.ip_addresses.is_empty())
+                    .filter_map(|observation| observation.hostname.as_deref())
+                    .map(normalize_hostname_key),
+            );
+            let count = store.record_mdns_services(&observations)?;
+            accepted = true;
+            messages.push(format!("recorded {count} mDNS service(s)"));
+        }
+        Err(error) => messages.push(format!("mDNS unavailable: {error}")),
+    }
+
+    match sources.lan {
+        Ok(observations) => {
+            let count = store.record_lan_devices(&observations)?;
+            accepted = true;
+            messages.push(format!("recorded {count} LAN ARP device(s)"));
+        }
+        Err(error) => messages.push(format!("LAN ARP unavailable: {error}")),
+    }
+
+    if !active_lan_ips.is_empty() {
+        let ip_strings = active_lan_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let changed = store.mark_lan_ips_reachable(&ip_strings)?;
+        messages.push(format!("marked {changed} LAN endpoint(s) reachable"));
+    }
+
+    let stale_after_seconds = if mode == RefreshMode::Full { 900 } else { 120 };
+    let stale_count = store.mark_stale_endpoint_checks_unknown(stale_after_seconds)?;
+    if stale_count > 0 {
+        messages.push(format!(
+            "marked {stale_count} stale endpoint check(s) unknown"
+        ));
+    }
+
+    Ok(RecordedRefresh {
+        accepted,
+        messages,
+        freshly_resolved_hosts,
+    })
+}
+
+fn select_probe_scope(
+    store: &SqliteStore,
+    mode: RefreshMode,
+    requested_device: &str,
+    messages: &mut Vec<String>,
+) -> Result<(Option<EndpointProbeScope>, Vec<NetworkEndpoint>)> {
+    if requested_device.is_empty() {
+        let scope = EndpointProbeScope::All {
+            tracked_only: mode != RefreshMode::Full,
+        };
+        let endpoints = scope.load(store)?;
+
+        return Ok((Some(scope), endpoints));
+    }
+
+    match store.find_identity_id(requested_device)? {
+        IdentityLookup::Found(identity_id) => {
+            let scope = EndpointProbeScope::Identity(identity_id);
+            let endpoints = scope.load(store)?;
+            Ok((Some(scope), endpoints))
+        }
+        IdentityLookup::NotFound => {
+            messages.push(format!(
+                "device '{requested_device}' was not found for targeted refresh"
+            ));
+            Ok((None, Vec::new()))
+        }
+        IdentityLookup::Ambiguous(ids) => {
+            messages.push(format!(
+                "device query '{requested_device}' is ambiguous: {}",
+                ids.join(", ")
+            ));
+            Ok((None, Vec::new()))
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl NetworkManager for DaemonService {
     async fn get_daemon_status(
@@ -89,153 +295,53 @@ impl NetworkManager for DaemonService {
     ) -> std::result::Result<Response<RefreshResponse>, Status> {
         let _refresh_guard = self.refresh_lock.lock().await;
         let request = request.into_inner();
-        let mode = if request.mode.is_empty() {
-            "quick".to_string()
-        } else {
-            request.mode
-        };
-
-        let tailscale_result = refresh_tailscale().await;
-        let active_probe_result = if mode == "full" {
-            Some(active_lan_probe().await)
-        } else {
-            None
-        };
-        let mdns_result = refresh_mdns_services().await;
-        let lan_result = refresh_lan_arp().await;
-
-        let mut accepted = false;
-        let mut targeted_lookup_failed = false;
-        let mut messages = Vec::new();
-        let mut active_lan_ips = Vec::new();
-
-        let endpoints = {
+        let mode = RefreshMode::parse(&request.mode).map_err(Status::invalid_argument)?;
+        let sources = collect_refresh_sources(mode).await;
+        let (mut refresh, probe_scope, mut endpoints) = {
             let store = self.store.lock().map_err(lock_error)?;
-            store.set_daemon_heartbeat().map_err(internal_error)?;
-
-            match tailscale_result {
-                Ok(snapshot) => {
-                    store
-                        .set_metadata("tailscale_service_state", &snapshot.backend_state)
-                        .map_err(internal_error)?;
-                    let count = store
-                        .record_tailscale_nodes(snapshot.tailnet.as_deref(), &snapshot.nodes)
-                        .map_err(internal_error)?;
-                    accepted = true;
-                    messages.push(format!("recorded {count} Tailscale device(s)"));
-                }
-                Err(error) => {
-                    store
-                        .set_metadata("tailscale_service_state", "unavailable")
-                        .map_err(internal_error)?;
-                    messages.push(format!("Tailscale unavailable: {error}"));
-                }
-            }
-
-            if let Some(active_probe_result) = active_probe_result {
-                match active_probe_result {
-                    Ok(ips) => {
-                        messages.push(format!("probed {} LAN address(es)", ips.len()));
-                        active_lan_ips = ips;
-                    }
-                    Err(error) => messages.push(format!("active LAN probe unavailable: {error}")),
-                }
-            }
-
-            match mdns_result {
-                Ok(observations) => {
-                    let count = store
-                        .record_mdns_services(&observations)
-                        .map_err(internal_error)?;
-                    accepted = true;
-                    messages.push(format!("recorded {count} mDNS service(s)"));
-                }
-                Err(error) => messages.push(format!("mDNS unavailable: {error}")),
-            }
-
-            match lan_result {
-                Ok(observations) => {
-                    let count = store
-                        .record_lan_devices(&observations)
-                        .map_err(internal_error)?;
-                    accepted = true;
-                    messages.push(format!("recorded {count} LAN ARP device(s)"));
-                }
-                Err(error) => messages.push(format!("LAN ARP unavailable: {error}")),
-            }
-
-            if !active_lan_ips.is_empty() {
-                let ip_strings = active_lan_ips
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                let changed = store
-                    .mark_lan_ips_reachable(&ip_strings)
-                    .map_err(internal_error)?;
-                messages.push(format!("marked {changed} LAN endpoint(s) reachable"));
-            }
-
-            let stale_after_seconds = if mode == "full" { 900 } else { 120 };
-            let stale_count = store
-                .mark_stale_endpoint_checks_unknown(stale_after_seconds)
-                .map_err(internal_error)?;
-            if stale_count > 0 {
-                messages.push(format!(
-                    "marked {stale_count} stale endpoint check(s) unknown"
-                ));
-            }
-
-            let requested_device = request.device_query.trim();
-            if requested_device.is_empty() {
-                store
-                    .list_endpoints_for_probe(mode != "full")
-                    .map_err(internal_error)?
-            } else {
-                match store
-                    .find_identity_id(requested_device)
-                    .map_err(internal_error)?
-                {
-                    IdentityLookup::Found(identity_id) => {
-                        let endpoints = store
-                            .endpoints_for_identity(&identity_id)
-                            .map_err(internal_error)?;
-                        messages.push(format!(
-                            "selected {} endpoint(s) for device refresh",
-                            endpoints.len()
-                        ));
-                        endpoints
-                    }
-                    IdentityLookup::NotFound => {
-                        targeted_lookup_failed = true;
-                        messages.push(format!(
-                            "device '{requested_device}' was not found for targeted refresh"
-                        ));
-                        Vec::new()
-                    }
-                    IdentityLookup::Ambiguous(ids) => {
-                        targeted_lookup_failed = true;
-                        messages.push(format!(
-                            "device query '{requested_device}' is ambiguous: {}",
-                            ids.join(", ")
-                        ));
-                        Vec::new()
-                    }
-                }
-            }
+            let mut refresh =
+                record_refresh_sources(&store, mode, sources).map_err(internal_error)?;
+            let (scope, endpoints) = select_probe_scope(
+                &store,
+                mode,
+                request.device_query.trim(),
+                &mut refresh.messages,
+            )
+            .map_err(internal_error)?;
+            (refresh, scope, endpoints)
         };
 
-        let resolved_endpoint_ips = resolve_existing_endpoint_ips(&endpoints).await;
+        let resolved_endpoint_ips =
+            resolve_existing_endpoint_ips(&endpoints, &refresh.freshly_resolved_hosts).await;
+        let mut changed_endpoint_count = 0;
         if !resolved_endpoint_ips.is_empty() {
             let store = self.store.lock().map_err(lock_error)?;
-            let mut changed = 0;
             for resolved in &resolved_endpoint_ips {
-                changed += store
+                changed_endpoint_count += store
                     .record_resolved_endpoint_ips(&resolved.endpoint, &resolved.ip_addresses)
                     .map_err(internal_error)?;
             }
-            if changed > 0 {
-                messages.push(format!("resolved {changed} endpoint IP address(es)"));
+            if changed_endpoint_count > 0 {
+                refresh.messages.push(format!(
+                    "resolved {changed_endpoint_count} endpoint IP address(es)"
+                ));
             }
+        }
+
+        if changed_endpoint_count > 0 {
+            let store = self.store.lock().map_err(lock_error)?;
+            if let Some(scope) = &probe_scope {
+                endpoints = scope.load(&store).map_err(internal_error)?;
+            }
+        }
+        if probe_scope
+            .as_ref()
+            .is_some_and(EndpointProbeScope::is_targeted)
+        {
+            refresh.messages.push(format!(
+                "selected {} endpoint(s) for device refresh",
+                endpoints.len()
+            ));
         }
 
         let probe_results = probe_ssh_endpoints(endpoints).await;
@@ -250,16 +356,18 @@ impl NetworkManager for DaemonService {
                     )
                     .map_err(internal_error)?;
             }
-            messages.push(format!("probed {} SSH endpoint(s)", probe_results.len()));
+            refresh
+                .messages
+                .push(format!("probed {} SSH endpoint(s)", probe_results.len()));
         }
 
-        if targeted_lookup_failed {
-            accepted = false;
+        if probe_scope.is_none() {
+            refresh.accepted = false;
         }
 
         Ok(Response::new(RefreshResponse {
-            accepted,
-            message: format!("{mode} refresh: {}", messages.join("; ")),
+            accepted: refresh.accepted,
+            message: format!("{} refresh: {}", mode.as_str(), refresh.messages.join("; ")),
         }))
     }
 
@@ -988,6 +1096,16 @@ struct MdnsBrowseService {
     raw_line: String,
 }
 
+struct ResolvedMdnsService {
+    service: MdnsBrowseService,
+    resolve_output: String,
+    hostname: Option<String>,
+    port: Option<u16>,
+}
+
+const MDNS_RESOLVE_BATCH_SIZE: usize = 12;
+const MDNS_RESOLVE_BATCH_LIMIT: usize = 3;
+
 async fn refresh_mdns_services() -> Result<Vec<MdnsServiceObservation>> {
     let service_types = [
         "_ssh._tcp",
@@ -1028,7 +1146,11 @@ async fn refresh_mdns_services() -> Result<Vec<MdnsServiceObservation>> {
     });
 
     let mut observations = Vec::new();
-    for chunk in services.chunks(12).take(3) {
+    let mut ip_addresses_by_hostname = HashMap::new();
+    for chunk in services
+        .chunks(MDNS_RESOLVE_BATCH_SIZE)
+        .take(MDNS_RESOLVE_BATCH_LIMIT)
+    {
         let resolve_handles = chunk
             .iter()
             .map(|service| {
@@ -1045,26 +1167,64 @@ async fn refresh_mdns_services() -> Result<Vec<MdnsServiceObservation>> {
                     )
                     .await
                     .unwrap_or_default();
-                    (service, resolve_output)
+                    let (hostname, port) = parse_dns_sd_resolve(&resolve_output)
+                        .map(|(hostname, port)| (Some(hostname), Some(port)))
+                        .unwrap_or((None, None));
+
+                    ResolvedMdnsService {
+                        service,
+                        resolve_output,
+                        hostname,
+                        port,
+                    }
                 })
             })
             .collect::<Vec<_>>();
 
+        let mut resolved_services = Vec::new();
         for handle in resolve_handles {
-            let Ok((service, resolve_output)) = handle.await else {
+            let Ok(resolved_service) = handle.await else {
                 continue;
             };
-            let (hostname, port) = parse_dns_sd_resolve(&resolve_output)
-                .map(|(hostname, port)| (Some(hostname), Some(port)))
-                .unwrap_or((None, None));
-            let ip_addresses = match hostname.as_deref() {
-                Some(hostname) => resolve_mdns_ip_addresses(hostname).await,
-                None => Vec::new(),
-            };
-            let raw_text = if resolve_output.trim().is_empty() {
+
+            resolved_services.push(resolved_service);
+        }
+
+        let unresolved_hostnames = resolved_services
+            .iter()
+            .filter_map(|resolved| resolved.hostname.as_deref())
+            .map(|hostname| (normalize_hostname_key(hostname), hostname.to_string()))
+            .filter(|(key, _)| !ip_addresses_by_hostname.contains_key(key))
+            .collect::<HashMap<_, _>>();
+        let address_handles = unresolved_hostnames
+            .into_iter()
+            .map(|(key, hostname)| {
+                tokio::spawn(async move {
+                    let ip_addresses = resolve_mdns_ip_addresses(&hostname).await;
+                    (key, ip_addresses)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in address_handles {
+            if let Ok((key, ip_addresses)) = handle.await {
+                ip_addresses_by_hostname.insert(key, ip_addresses);
+            }
+        }
+
+        for resolved in resolved_services {
+            let service = resolved.service;
+            let ip_addresses = resolved
+                .hostname
+                .as_deref()
+                .and_then(|hostname| {
+                    ip_addresses_by_hostname.get(&normalize_hostname_key(hostname))
+                })
+                .cloned()
+                .unwrap_or_default();
+            let raw_text = if resolved.resolve_output.trim().is_empty() {
                 service.raw_line.clone()
             } else {
-                format!("{}\n{}", service.raw_line, resolve_output.trim())
+                format!("{}\n{}", service.raw_line, resolved.resolve_output.trim())
             };
 
             observations.push(MdnsServiceObservation {
@@ -1075,9 +1235,9 @@ async fn refresh_mdns_services() -> Result<Vec<MdnsServiceObservation>> {
                 service_name: service.service_name,
                 service_type: service.service_type,
                 domain: service.domain,
-                hostname,
+                hostname: resolved.hostname,
                 ip_addresses,
-                port,
+                port: resolved.port,
                 raw_text,
             });
         }
@@ -1186,14 +1346,25 @@ fn parse_dns_sd_address_lookup(output: &str) -> Vec<String> {
     output
         .split_whitespace()
         .filter_map(|token| token.trim_end_matches('.').parse::<IpAddr>().ok())
-        .filter(|ip| !ip.is_loopback() && !ip.is_multicast() && !ip.is_unspecified())
+        .filter(is_usable_mdns_ip)
         .map(|ip| ip.to_string())
         .filter(|ip| seen.insert(ip.clone()))
         .collect()
 }
 
+fn is_usable_mdns_ip(ip: &IpAddr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_unspecified()
+        && !matches!(ip, IpAddr::V6(address) if address.is_unicast_link_local())
+}
+
 fn trim_dns_sd_field(value: &str) -> String {
     value.trim().trim_end_matches('.').to_string()
+}
+
+fn normalize_hostname_key(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 #[derive(Debug)]
@@ -1209,28 +1380,54 @@ struct ResolvedEndpointIps {
     ip_addresses: Vec<String>,
 }
 
-async fn resolve_existing_endpoint_ips(endpoints: &[NetworkEndpoint]) -> Vec<ResolvedEndpointIps> {
-    let handles = endpoints
+async fn resolve_existing_endpoint_ips(
+    endpoints: &[NetworkEndpoint],
+    resolved_hosts: &HashSet<String>,
+) -> Vec<ResolvedEndpointIps> {
+    let mut endpoints_by_hostname = HashMap::<String, (String, Vec<NetworkEndpoint>)>::new();
+    for endpoint in endpoints
         .iter()
         .filter(|endpoint| matches!(endpoint.kind, EndpointKind::LanDns | EndpointKind::Mdns))
         .filter(|endpoint| endpoint.address.parse::<IpAddr>().is_err())
-        .map(|endpoint| {
-            let endpoint = endpoint.clone();
-            tokio::spawn(async move {
-                let host = endpoint.host_for_connection().to_string();
-                let ip_addresses = resolve_mdns_ip_addresses(&host).await;
-                (!ip_addresses.is_empty()).then_some(ResolvedEndpointIps {
-                    endpoint,
-                    ip_addresses,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
+    {
+        let hostname = endpoint.host_for_connection();
+        let key = normalize_hostname_key(hostname);
+        if resolved_hosts.contains(&key) {
+            continue;
+        }
+        endpoints_by_hostname
+            .entry(key)
+            .or_insert_with(|| (hostname.to_string(), Vec::new()))
+            .1
+            .push(endpoint.clone());
+    }
+    let mut candidates = endpoints_by_hostname.into_values().collect::<Vec<_>>();
+    candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
     let mut resolved = Vec::new();
-    for handle in handles {
-        if let Ok(Some(result)) = handle.await {
-            resolved.push(result);
+    for chunk in candidates.chunks(MDNS_RESOLVE_BATCH_SIZE) {
+        let handles = chunk
+            .iter()
+            .map(|candidate| {
+                let (hostname, endpoints) = candidate.clone();
+                tokio::spawn(async move {
+                    let ip_addresses = resolve_mdns_ip_addresses(&hostname).await;
+                    (endpoints, ip_addresses)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            let Ok((endpoints, ip_addresses)) = handle.await else {
+                continue;
+            };
+            if ip_addresses.is_empty() {
+                continue;
+            }
+            resolved.extend(endpoints.into_iter().map(|endpoint| ResolvedEndpointIps {
+                endpoint,
+                ip_addresses: ip_addresses.clone(),
+            }));
         }
     }
     resolved
@@ -1258,9 +1455,11 @@ async fn probe_ssh_endpoints(endpoints: Vec<NetworkEndpoint>) -> Vec<EndpointPro
 async fn probe_ssh_endpoint(endpoint: NetworkEndpoint) -> EndpointProbeResult {
     let host = endpoint.host_for_connection().to_string();
     let port = endpoint.port.unwrap_or(22);
-    let target = format!("{host}:{port}");
-    let result =
-        tokio::time::timeout(Duration::from_millis(900), TcpStream::connect(&target)).await;
+    let result = tokio::time::timeout(
+        Duration::from_millis(900),
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await;
 
     match result {
         Ok(Ok(_stream)) => EndpointProbeResult {
@@ -1550,6 +1749,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refresh_mode_rejects_unknown_values() {
+        assert_eq!(RefreshMode::parse("").unwrap(), RefreshMode::Quick);
+        assert_eq!(RefreshMode::parse("full").unwrap(), RefreshMode::Full);
+        assert!(RefreshMode::parse("everything").is_err());
+    }
+
+    #[test]
     fn parses_dns_sd_browse_services_with_spaces() {
         let output = "Browsing for _ssh._tcp.local.\nTimestamp     A/R    Flags  if Domain               Service Type         Instance Name\n13:05:01.000  Add        3  14 local.               _ssh._tcp.          Office MacBook Pro\n13:05:02.000  Rmv        0  14 local.               _ssh._tcp.          Old Host\n";
 
@@ -1581,11 +1787,49 @@ mod tests {
 
     #[test]
     fn parses_dns_sd_address_lookup_ips() {
-        let output = "DATE: ---Fri 19 Jun 2026---\n10:00:01.000  Add  3  14  office-macbook.local.  192.168.1.20  120\n10:00:01.001  Add  3  14  office-macbook.local.  fe80::1234:abcd  120\n10:00:01.002  Add  3  14  office-macbook.local.  224.0.0.251  120\n";
+        let output = "DATE: ---Fri 19 Jun 2026---\n10:00:01.000  Add  3  14  office-macbook.local.  192.168.1.20  120\n10:00:01.001  Add  3  14  office-macbook.local.  fe80::1234:abcd  120\n10:00:01.002  Add  3  14  office-macbook.local.  2001:db8::20  120\n10:00:01.003  Add  3  14  office-macbook.local.  224.0.0.251  120\n";
 
         assert_eq!(
             parse_dns_sd_address_lookup(output),
-            vec!["192.168.1.20".to_string(), "fe80::1234:abcd".to_string()]
+            vec!["192.168.1.20".to_string(), "2001:db8::20".to_string()]
         );
+    }
+
+    #[test]
+    fn reloading_probe_scope_includes_newly_resolved_ips() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(tempdir.path().join("test.sqlite")).unwrap();
+        store.migrate().unwrap();
+        store
+            .record_mdns_services(&[MdnsServiceObservation {
+                source_device_id: "local.:_ssh._tcp.:Office Mac".to_string(),
+                service_name: "Office Mac".to_string(),
+                service_type: "_ssh._tcp".to_string(),
+                domain: "local".to_string(),
+                hostname: Some("office-mac.local".to_string()),
+                ip_addresses: Vec::new(),
+                port: Some(22),
+                raw_text: "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
+                    .to_string(),
+            }])
+            .unwrap();
+
+        let identity_id = store.list_device_identities().unwrap()[0]
+            .identity
+            .id
+            .clone();
+        let scope = EndpointProbeScope::Identity(identity_id);
+        let initial_endpoints = scope.load(&store).unwrap();
+        store
+            .record_resolved_endpoint_ips(&initial_endpoints[0], &["192.168.1.20".to_string()])
+            .unwrap();
+
+        let refreshed_endpoints = scope.load(&store).unwrap();
+        assert_eq!(initial_endpoints.len(), 1);
+        assert!(refreshed_endpoints.iter().any(|endpoint| {
+            endpoint.kind == EndpointKind::LanIp
+                && endpoint.address == "192.168.1.20"
+                && endpoint.reachability == AvailabilityState::Unknown
+        }));
     }
 }

@@ -7,7 +7,7 @@ use network_manager_core::AvailabilityState;
 use crate::app::NetworkManagerApp;
 use crate::components::{buttons, icons::Icon, status};
 use crate::data::{ActionStatus, DashboardVm, TrackedDeviceRowVm};
-use crate::layout::app_shell::v4_route_shell;
+use crate::layout::app_shell::{route_shell, TitlebarAction};
 use crate::routes::Route;
 use crate::theme::LiquidGlassTokens;
 
@@ -20,12 +20,11 @@ pub fn screen(
     cx: &mut Context<NetworkManagerApp>,
 ) -> Div {
     let main = dashboard_main(vm, action_status, tokens, cx);
-    v4_route_shell(
+    route_shell(
         Route::Dashboard,
         Icon::Network,
         "Network Manager",
-        &[Icon::Search, Icon::Bell, Icon::Settings],
-        true,
+        &[TitlebarAction::ShowDiscovery, TitlebarAction::ShowSettings],
         main,
         tokens,
         cx,
@@ -51,6 +50,7 @@ fn dashboard_main(
         .flex_col()
         .gap(px(22.0))
         .child(header(vm, action_status, tokens, cx))
+        .children(action_status.map(|status| status::action_banner(status, tokens)))
         .child(metrics(vm, tokens))
         .child(device_table(&vm.tracked, tokens, cx))
 }
@@ -61,7 +61,7 @@ fn header(
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> Div {
-    let label = if action_status.is_some_and(|status| status.is_pending) {
+    let label = if action_status.is_some_and(ActionStatus::is_pending) {
         "Scanning"
     } else {
         "Quick scan"
@@ -394,16 +394,9 @@ fn action_cell(
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> Div {
-    let label = if row.ssh == AvailabilityState::Online {
-        "SSH"
-    } else if row.overall == AvailabilityState::Unknown {
-        "Details"
-    } else {
-        "Open"
-    };
     let identity_id = row.id.clone();
     div().w(px(DASH_COLS[5])).flex().justify_end().child(
-        buttons::action_button(label, tokens)
+        buttons::action_button("Details", tokens)
             .id(SharedString::from(format!("dashboard-action-{}", row.id)))
             .on_click(
                 cx.listener(move |app, _, _, cx| app.select_device_detail(identity_id.clone(), cx)),

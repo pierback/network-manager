@@ -7,18 +7,16 @@ use gpui::{
 use network_manager_core::TrackedState;
 
 use crate::data::{
-    ActionOutcome, ActionStatus, DaemonActions, DaemonLifecycleAction, DashboardVm, DeviceDetailVm,
-    DiscoveryVm, MockRepository, NetworkManagerActions, NetworkManagerRepository, NoopActions,
-    QuickAccessVm, RefreshMode, SettingsVm, SqliteRepository,
+    ActionOutcome, ActionStatus, DaemonActions, DaemonLifecycleAction, NetworkManagerActions,
+    NetworkManagerRepository, RefreshMode, SqliteRepository,
 };
 use crate::hotkeys::{
-    ActualSize, BringAllToFront, CloseWindow, Find, FindNext, FindPrevious, MinimizeWindow,
-    NewWindow, NextRoute, Open, PreviousRoute, Print, RefreshFull, RefreshQuick, Save, SaveAs,
-    ShowDashboard, ShowDeviceDetail, ShowDiscovery, ShowKeyboardShortcuts, ShowQuickAccess,
-    ShowSettings, ToggleFullscreen, ToggleSidebar, ZoomIn, ZoomOut, ZoomWindow, KEY_CONTEXT,
+    BringAllToFront, CloseWindow, MinimizeWindow, NewWindow, NextRoute, PreviousRoute, RefreshFull,
+    RefreshQuick, ShowDashboard, ShowDeviceDetail, ShowDiscovery, ShowKeyboardShortcuts,
+    ShowQuickAccess, ShowSettings, ToggleFullscreen, ZoomWindow, KEY_CONTEXT,
 };
 use crate::layout::app_shell::window_shell;
-use crate::routes::{DiscoveryFilter, Route, SettingsSection};
+use crate::routes::{DiscoveryFilter, Route};
 use crate::screens::{dashboard, device_detail, discovery, quick_access, settings};
 use crate::theme::LiquidGlassTokens;
 
@@ -30,7 +28,6 @@ pub struct NetworkManagerApp {
     actions: Arc<dyn NetworkManagerActions>,
     selected_device_id: Option<String>,
     selected_discovery_filter: DiscoveryFilter,
-    selected_settings_section: SettingsSection,
     startup_backend_checked: bool,
     action_status: Option<ActionStatus>,
     action_sequence: u64,
@@ -38,20 +35,12 @@ pub struct NetworkManagerApp {
     focus_handle: Option<FocusHandle>,
 }
 
-enum RouteViewModel {
-    Dashboard(DashboardVm),
-    Discovery(DiscoveryVm),
-    DeviceDetail(DeviceDetailVm),
-    QuickAccess(QuickAccessVm),
-    Settings(SettingsVm),
-}
-
 impl NetworkManagerApp {
-    pub fn new(repository: impl NetworkManagerRepository + 'static) -> Self {
-        Self::new_with_actions(repository, NoopActions)
+    pub fn live() -> Self {
+        Self::new_with_actions(SqliteRepository::default(), DaemonActions::default())
     }
 
-    pub fn new_with_actions(
+    fn new_with_actions(
         repository: impl NetworkManagerRepository + 'static,
         actions: impl NetworkManagerActions + 'static,
     ) -> Self {
@@ -61,29 +50,32 @@ impl NetworkManagerApp {
             actions: Arc::new(actions),
             selected_device_id: None,
             selected_discovery_filter: DiscoveryFilter::AllSources,
-            selected_settings_section: SettingsSection::Discovery,
             startup_backend_checked: false,
             action_status: None,
             action_sequence: 0,
-            tokens: LiquidGlassTokens::v4(),
+            tokens: LiquidGlassTokens::default(),
             focus_handle: None,
         }
     }
 
-    pub fn live() -> Self {
-        Self::new_with_actions(SqliteRepository::default(), DaemonActions::default())
-    }
-
-    pub fn mock() -> Self {
-        Self::new(MockRepository::new())
-    }
-
-    pub fn current_route(&self) -> Route {
+    #[cfg(test)]
+    fn current_route(&self) -> Route {
         self.route
     }
 
-    pub fn action_status(&self) -> Option<&ActionStatus> {
+    #[cfg(test)]
+    fn action_status(&self) -> Option<&ActionStatus> {
         self.action_status.as_ref()
+    }
+
+    #[cfg(test)]
+    fn current_discovery_filter(&self) -> DiscoveryFilter {
+        self.selected_discovery_filter
+    }
+
+    #[cfg(test)]
+    fn selected_device_id(&self) -> Option<&str> {
+        self.selected_device_id.as_deref()
     }
 
     pub(crate) fn set_route(&mut self, route: Route, cx: &mut Context<Self>) {
@@ -107,39 +99,31 @@ impl NetworkManagerApp {
         cx.notify();
     }
 
-    pub(crate) fn select_settings_section(
-        &mut self,
-        section: SettingsSection,
-        cx: &mut Context<Self>,
-    ) {
-        self.selected_settings_section = section;
-        self.route = Route::Settings;
-        cx.notify();
-    }
-
-    pub fn select_route_for_test(&mut self, route: Route) {
+    #[cfg(test)]
+    fn select_route_for_test(&mut self, route: Route) {
         self.route = route;
     }
 
-    pub fn refresh_for_test(&mut self, mode: RefreshMode) {
-        self.refresh_inner(mode);
+    #[cfg(test)]
+    fn refresh_for_test(&mut self, mode: RefreshMode) {
+        let result = self.actions.refresh(mode);
+        self.record_action_result(result);
     }
 
-    pub fn daemon_lifecycle_for_test(&mut self, action: DaemonLifecycleAction) {
+    #[cfg(test)]
+    fn daemon_lifecycle_for_test(&mut self, action: DaemonLifecycleAction) {
         let result = self.actions.daemon_lifecycle(action);
         self.record_action_result(result);
     }
 
-    pub fn open_diagnostics_folder_for_test(&mut self) {
+    #[cfg(test)]
+    fn open_diagnostics_folder_for_test(&mut self) {
         let result = self.actions.open_diagnostics_folder();
         self.record_action_result(result);
     }
 
-    pub fn track_discovery_identity_for_test(&mut self, identity_id: Option<String>) {
-        self.set_discovery_identity_state_inner(identity_id, TrackedState::Tracked);
-    }
-
-    pub fn set_discovery_identity_state_for_test(
+    #[cfg(test)]
+    fn set_discovery_identity_state_for_test(
         &mut self,
         identity_id: Option<String>,
         state: TrackedState,
@@ -151,12 +135,10 @@ impl NetworkManagerApp {
         self.start_refresh(RefreshMode::Quick, cx);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn refresh_full(&mut self, cx: &mut Context<Self>) {
         self.start_refresh(RefreshMode::Full, cx);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set_discovery_identity_state(
         &mut self,
         identity_id: Option<String>,
@@ -168,13 +150,10 @@ impl NetworkManagerApp {
         }
         let Some(identity_id) = identity_id else {
             self.invalidate_pending_action();
-            self.action_status = Some(ActionStatus {
-                message: "Cannot update this discovery yet because it has no device identity."
-                    .into(),
-                detail: None,
-                is_error: true,
-                is_pending: false,
-            });
+            self.action_status = Some(ActionStatus::failed(
+                "Cannot update this discovery yet because it has no device identity.",
+                None,
+            ));
             cx.notify();
             return;
         };
@@ -183,30 +162,6 @@ impl NetworkManagerApp {
             format!("Marking {identity_id} {action}…"),
             cx,
             move |actions| actions.set_tracked_state(&identity_id, state),
-        );
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn refresh_device(&mut self, identity_id: String, cx: &mut Context<Self>) {
-        if identity_id.is_empty() || identity_id == "empty" {
-            self.start_refresh(RefreshMode::Quick, cx);
-            return;
-        }
-        self.start_action(format!("Refreshing {identity_id}…"), cx, move |actions| {
-            actions.refresh_device(RefreshMode::Quick, &identity_id)
-        });
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn split_discovered_device(
-        &mut self,
-        discovered_device_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.start_action(
-            format!("Splitting {discovered_device_id}…"),
-            cx,
-            move |actions| actions.split_discovered_device(&discovered_device_id),
         );
     }
 
@@ -269,24 +224,12 @@ impl NetworkManagerApp {
             ..Default::default()
         };
         if let Err(error) = cx.open_window(options, |_, cx| cx.new(|_| NetworkManagerApp::live())) {
-            self.action_status = Some(ActionStatus {
-                message: format!("Could not open a new window: {error}"),
-                detail: None,
-                is_error: true,
-                is_pending: false,
-            });
+            self.action_status = Some(ActionStatus::failed(
+                format!("Could not open a new window: {error}"),
+                None,
+            ));
             cx.notify();
         }
-    }
-
-    fn record_standard_action(&mut self, action: &str, cx: &mut Context<Self>) {
-        self.action_status = Some(ActionStatus {
-            message: format!("{action} has no editable document state in Network Manager yet."),
-            detail: None,
-            is_error: false,
-            is_pending: false,
-        });
-        cx.notify();
     }
 
     fn start_action(
@@ -300,12 +243,7 @@ impl NetworkManagerApp {
         if self.record_busy_action(cx) {
             return;
         }
-        self.action_status = Some(ActionStatus {
-            message: pending_message,
-            detail: None,
-            is_error: false,
-            is_pending: true,
-        });
+        self.action_status = Some(ActionStatus::pending(pending_message));
         let action_sequence = self.next_action_sequence();
         cx.notify();
 
@@ -324,24 +262,7 @@ impl NetworkManagerApp {
         .detach();
     }
 
-    fn refresh_inner(&mut self, mode: RefreshMode) {
-        let result = self.actions.refresh(mode);
-        self.record_action_result(result);
-    }
-
-    fn view_model_for_route(&self, route: Route) -> RouteViewModel {
-        match route {
-            Route::Dashboard => RouteViewModel::Dashboard(self.repository.dashboard()),
-            Route::Discovery => RouteViewModel::Discovery(self.repository.discovery()),
-            Route::DeviceDetail => RouteViewModel::DeviceDetail(
-                self.repository
-                    .selected_device_detail(self.selected_device_id.as_deref()),
-            ),
-            Route::QuickAccess => RouteViewModel::QuickAccess(self.repository.quick_access()),
-            Route::Settings => RouteViewModel::Settings(self.repository.settings()),
-        }
-    }
-
+    #[cfg(test)]
     fn set_discovery_identity_state_inner(
         &mut self,
         identity_id: Option<String>,
@@ -349,13 +270,10 @@ impl NetworkManagerApp {
     ) {
         let Some(identity_id) = identity_id else {
             self.invalidate_pending_action();
-            self.action_status = Some(ActionStatus {
-                message: "Cannot update this discovery yet because it has no device identity."
-                    .into(),
-                detail: None,
-                is_error: true,
-                is_pending: false,
-            });
+            self.action_status = Some(ActionStatus::failed(
+                "Cannot update this discovery yet because it has no device identity.",
+                None,
+            ));
             return;
         };
         let result = self.actions.set_tracked_state(&identity_id, state);
@@ -366,14 +284,11 @@ impl NetworkManagerApp {
         if self
             .action_status
             .as_ref()
-            .is_some_and(|status| status.is_pending)
+            .is_some_and(ActionStatus::is_pending)
         {
-            self.action_status = Some(ActionStatus {
-                message: "Another network action is already running; wait for it to finish.".into(),
-                detail: None,
-                is_error: false,
-                is_pending: true,
-            });
+            self.action_status = Some(ActionStatus::pending(
+                "Another network action is already running; wait for it to finish.",
+            ));
             cx.notify();
             true
         } else {
@@ -432,12 +347,10 @@ impl NetworkManagerApp {
     }
 
     pub(crate) fn show_keyboard_shortcuts(&mut self, cx: &mut Context<Self>) {
-        self.action_status = Some(ActionStatus {
-            message: "⌘1 Dashboard · ⌘2 Discovery · ⌘3 Detail · ⌘4 Quick Access · ⌘, Settings · ⌘R Refresh · ⇧⌘R Full Refresh · ⌘[/⌘] Previous/Next · ⌘K Quick Access · ⌘/ Shortcuts".into(),
-            detail: None,
-            is_error: false,
-            is_pending: false,
-        });
+        self.action_status = Some(ActionStatus::succeeded(
+            "⌘1 Dashboard · ⌘2 Discovery · ⌘3 Detail · ⌘4 Quick Access · ⌘, Settings · ⌘R Refresh · ⇧⌘R Full Refresh · ⌘[/⌘] Previous/Next · ⌘K Quick Access · ⌘/ Shortcuts",
+            None,
+        ));
         cx.notify();
     }
 
@@ -452,7 +365,7 @@ impl NetworkManagerApp {
             );
             return;
         };
-        let command = format!("ssh {}", target.destination);
+        let command = target.command;
         cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
         self.record_info_message(format!("Copied {command}"), cx);
     }
@@ -470,12 +383,7 @@ impl NetworkManagerApp {
     }
 
     fn record_detail_copy_error(&mut self, message: &'static str, cx: &mut Context<Self>) {
-        self.action_status = Some(ActionStatus {
-            message: message.into(),
-            detail: None,
-            is_error: true,
-            is_pending: false,
-        });
+        self.action_status = Some(ActionStatus::failed(message, None));
         cx.notify();
     }
 
@@ -484,12 +392,7 @@ impl NetworkManagerApp {
         message: impl Into<String>,
         cx: &mut Context<Self>,
     ) {
-        self.action_status = Some(ActionStatus {
-            message: message.into(),
-            detail: None,
-            is_error: false,
-            is_pending: false,
-        });
+        self.action_status = Some(ActionStatus::succeeded(message, None));
         cx.notify();
     }
 
@@ -513,11 +416,10 @@ fn action_status_from_outcome(outcome: ActionOutcome, is_error: bool) -> ActionS
         outcome.detail.or(Some(raw_message))
     };
 
-    ActionStatus {
-        message,
-        detail,
-        is_error,
-        is_pending: false,
+    if is_error {
+        ActionStatus::failed(message, detail)
+    } else {
+        ActionStatus::succeeded(message, detail)
     }
 }
 
@@ -594,30 +496,35 @@ impl Render for NetworkManagerApp {
         let route = self.route;
         let action_status = self.action_status.clone();
 
-        let content = match self.view_model_for_route(route) {
-            RouteViewModel::Dashboard(dashboard_vm) => {
-                dashboard::screen(&dashboard_vm, action_status.as_ref(), tokens, cx)
+        let content = match route {
+            Route::Dashboard => {
+                let vm = self.repository.dashboard();
+                dashboard::screen(&vm, action_status.as_ref(), tokens, cx)
             }
-            RouteViewModel::Discovery(discovery_vm) => discovery::screen(
-                &discovery_vm,
-                self.selected_discovery_filter,
-                action_status.as_ref(),
-                tokens,
-                cx,
-            ),
-            RouteViewModel::DeviceDetail(detail_vm) => {
-                device_detail::screen(&detail_vm, action_status.as_ref(), tokens, cx)
+            Route::Discovery => {
+                let vm = self.repository.discovery();
+                discovery::screen(
+                    &vm,
+                    self.selected_discovery_filter,
+                    action_status.as_ref(),
+                    tokens,
+                    cx,
+                )
             }
-            RouteViewModel::QuickAccess(quick_vm) => {
-                quick_access::screen(&quick_vm, action_status.as_ref(), tokens, cx)
+            Route::DeviceDetail => {
+                let vm = self
+                    .repository
+                    .selected_device_detail(self.selected_device_id.as_deref());
+                device_detail::screen(&vm, action_status.as_ref(), tokens, cx)
             }
-            RouteViewModel::Settings(settings_vm) => settings::screen(
-                &settings_vm,
-                self.selected_settings_section,
-                action_status.as_ref(),
-                tokens,
-                cx,
-            ),
+            Route::QuickAccess => {
+                let vm = self.repository.quick_access();
+                quick_access::screen(&vm, action_status.as_ref(), tokens, cx)
+            }
+            Route::Settings => {
+                let vm = self.repository.settings();
+                settings::screen(&vm, action_status.as_ref(), tokens, cx)
+            }
         };
         let focus_handle = self.ensure_focus_handle(window, cx);
 
@@ -652,17 +559,6 @@ impl NetworkManagerApp {
                 }),
             )
             .on_action(cx.listener(|app, _: &NewWindow, _, cx| app.open_new_window(cx)))
-            .on_action(cx.listener(|app, _: &Open, _, cx| app.set_route(Route::Discovery, cx)))
-            .on_action(cx.listener(|app, _: &Save, _, cx| app.record_standard_action("Save", cx)))
-            .on_action(
-                cx.listener(|app, _: &SaveAs, _, cx| app.record_standard_action("Save As", cx)),
-            )
-            .on_action(cx.listener(|app, _: &Print, _, cx| app.record_standard_action("Print", cx)))
-            .on_action(cx.listener(|app, _: &Find, _, cx| app.set_route(Route::Discovery, cx)))
-            .on_action(cx.listener(|app, _: &FindNext, _, cx| app.set_route(Route::Discovery, cx)))
-            .on_action(
-                cx.listener(|app, _: &FindPrevious, _, cx| app.set_route(Route::Discovery, cx)),
-            )
             .on_action(
                 cx.listener(|app, _: &ShowSettings, _, cx| app.set_route(Route::Settings, cx)),
             )
@@ -670,17 +566,11 @@ impl NetworkManagerApp {
             .on_action(cx.listener(|app, _: &NextRoute, _, cx| app.next_route(cx)))
             .on_action(cx.listener(|app, _: &RefreshQuick, _, cx| app.refresh_quick(cx)))
             .on_action(cx.listener(|app, _: &RefreshFull, _, cx| app.refresh_full(cx)))
-            .on_action(cx.listener(|app, _: &ToggleSidebar, _, cx| {
-                app.record_standard_action("Toggle Sidebar", cx)
-            }))
             .on_action(
                 cx.listener(|app, _: &ShowKeyboardShortcuts, _, cx| {
                     app.show_keyboard_shortcuts(cx)
                 }),
             )
-            .on_action(|_: &ZoomIn, window, _| window.zoom_window())
-            .on_action(|_: &ZoomOut, window, _| window.resize(size(px(1280.0), px(800.0))))
-            .on_action(|_: &ActualSize, window, _| window.resize(size(px(1280.0), px(800.0))))
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
             .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
@@ -692,66 +582,156 @@ impl NetworkManagerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::{
+        DaemonStatusVm, DashboardVm, DeviceDetailVm, DeviceIdentityVm, DiscoveryRowVm, DiscoveryVm,
+        EndpointGroup, EndpointVm, QuickAccessVm, SettingsVm, SshTargetVm, TrackedDeviceRowVm,
+    };
+    use crate::hotkeys::install_app_hotkeys;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use network_manager_core::{AvailabilityState, EndpointKind, EndpointPreference};
     use std::sync::{Arc, Mutex};
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
+    struct FixtureRepository {
+        reads: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl FixtureRepository {
+        fn record(&self, screen: &'static str) {
+            self.reads.lock().unwrap().push(screen);
+        }
+    }
+
+    impl NetworkManagerRepository for FixtureRepository {
+        fn dashboard(&self) -> DashboardVm {
+            self.record("dashboard");
+            DashboardVm {
+                daemon: fixture_daemon(),
+                tracked: vec![fixture_tracked_device()],
+                online_count: 1,
+                tailscale_count: 1,
+            }
+        }
+
+        fn discovery(&self) -> DiscoveryVm {
+            self.record("discovery");
+            DiscoveryVm {
+                rows: vec![DiscoveryRowVm {
+                    id: "discovery-1".into(),
+                    identity_id: Some("device-1".into()),
+                    display_name: "Device One".into(),
+                    hostname: "device.local".into(),
+                    ip_address: "192.168.1.20".into(),
+                    source: "mDNS".into(),
+                    sources: vec!["LAN".into(), "Tailscale".into()],
+                    category: "Computer".into(),
+                    tracked_state: TrackedState::Untracked,
+                    availability: AvailabilityState::Online,
+                    ssh_capable: true,
+                    last_seen: "now".into(),
+                }],
+            }
+        }
+
+        fn selected_device_detail(&self, selected_identity_id: Option<&str>) -> DeviceDetailVm {
+            self.record("detail");
+            fixture_detail(selected_identity_id.unwrap_or("device-1"))
+        }
+
+        fn quick_access(&self) -> QuickAccessVm {
+            self.record("quick_access");
+            QuickAccessVm {
+                rows: vec![fixture_tracked_device()],
+                last_scan: "now".into(),
+            }
+        }
+
+        fn settings(&self) -> SettingsVm {
+            self.record("settings");
+            SettingsVm {
+                daemon: fixture_daemon(),
+            }
+        }
+    }
+
+    fn fixture_daemon() -> DaemonStatusVm {
+        DaemonStatusVm {
+            state: AvailabilityState::Online,
+            source: "fixture".into(),
+            tailscale_service: AvailabilityState::Online,
+            local_ip_address: "192.168.1.10".into(),
+            last_scan: "now".into(),
+            stale: false,
+        }
+    }
+
+    fn fixture_tracked_device() -> TrackedDeviceRowVm {
+        TrackedDeviceRowVm {
+            id: "device-1".into(),
+            label: "Device One".into(),
+            alias: "device".into(),
+            category: "Computer".into(),
+            overall: AvailabilityState::Online,
+            lan: AvailabilityState::Online,
+            tailscale: AvailabilityState::Online,
+            ssh: AvailabilityState::Online,
+            preferred_target: "alice@device.local".into(),
+            target_reason: "LAN endpoint is reachable".into(),
+            last_seen: "now".into(),
+        }
+    }
+
+    fn fixture_identity(id: &str) -> DeviceIdentityVm {
+        DeviceIdentityVm {
+            id: id.into(),
+            label: "Device One".into(),
+            alias: "device".into(),
+            category: "Computer".into(),
+            tracked_state: TrackedState::Tracked,
+            availability: AvailabilityState::Online,
+            ssh_username: Some("alice".into()),
+            endpoint_preference: EndpointPreference::LanFirst,
+        }
+    }
+
+    fn fixture_detail(id: &str) -> DeviceDetailVm {
+        let preferred_target = (id != "no-target").then(|| SshTargetVm {
+            destination: "alice@device.local".into(),
+            command: "ssh -p 2222 alice@device.local".into(),
+            reason: "LAN endpoint is reachable".into(),
+        });
+        DeviceDetailVm {
+            identity: fixture_identity(id),
+            device_list: vec![fixture_identity("device-1")],
+            endpoints: vec![EndpointVm {
+                id: "endpoint-1".into(),
+                group: EndpointGroup::Lan,
+                kind: EndpointKind::LanDns,
+                address: "device.local".into(),
+                hostname: Some("device.local".into()),
+                port: Some(2222),
+                reachability: AvailabilityState::Online,
+                ssh_capability: AvailabilityState::Online,
+                last_checked: "now".into(),
+                preferred: true,
+            }],
+            preferred_target,
+            evidence: vec!["mDNS observation".into()],
+        }
+    }
+
+    #[derive(Clone, Default)]
     struct RecordingActions {
         calls: Arc<Mutex<Vec<String>>>,
         fail: bool,
     }
 
-    #[derive(Clone)]
-    struct CountingRepository {
-        calls: Arc<Mutex<Vec<&'static str>>>,
-    }
-
-    impl CountingRepository {
-        fn record(&self, call: &'static str) {
-            self.calls.lock().unwrap().push(call);
-        }
-    }
-
-    impl NetworkManagerRepository for CountingRepository {
-        fn dashboard(&self) -> DashboardVm {
-            self.record("dashboard");
-            MockRepository::new().dashboard()
-        }
-
-        fn discovery(&self) -> DiscoveryVm {
-            self.record("discovery");
-            MockRepository::new().discovery()
-        }
-
-        fn selected_device_detail(&self, selected_identity_id: Option<&str>) -> DeviceDetailVm {
-            self.record("detail");
-            MockRepository::new().selected_device_detail(selected_identity_id)
-        }
-
-        fn quick_access(&self) -> QuickAccessVm {
-            self.record("quick_access");
-            MockRepository::new().quick_access()
-        }
-
-        fn settings(&self) -> SettingsVm {
-            self.record("settings");
-            MockRepository::new().settings()
-        }
-    }
-
     impl NetworkManagerActions for RecordingActions {
         fn refresh(&self, mode: RefreshMode) -> anyhow::Result<ActionOutcome> {
-            self.refresh_device(mode, "")
-        }
-
-        fn refresh_device(
-            &self,
-            mode: RefreshMode,
-            device_query: &str,
-        ) -> anyhow::Result<ActionOutcome> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("refresh:{}:{device_query}", mode.as_str()));
+                .push(format!("refresh:{}", mode.as_str()));
             if self.fail {
                 anyhow::bail!("refresh failed");
             }
@@ -781,35 +761,6 @@ mod tests {
             Ok(ActionOutcome::new("track ok"))
         }
 
-        fn merge_identities(
-            &self,
-            source_query: &str,
-            target_query: &str,
-        ) -> anyhow::Result<ActionOutcome> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("merge:{source_query}:{target_query}"));
-            if self.fail {
-                anyhow::bail!("merge failed");
-            }
-            Ok(ActionOutcome::new("merge ok"))
-        }
-
-        fn split_discovered_device(
-            &self,
-            discovered_device_id: &str,
-        ) -> anyhow::Result<ActionOutcome> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("split:{discovered_device_id}"));
-            if self.fail {
-                anyhow::bail!("split failed");
-            }
-            Ok(ActionOutcome::new("split ok"))
-        }
-
         fn daemon_lifecycle(&self, action: DaemonLifecycleAction) -> anyhow::Result<ActionOutcome> {
             self.calls
                 .lock()
@@ -830,32 +781,245 @@ mod tests {
         }
     }
 
-    #[test]
-    fn route_selection_keeps_all_screens_reachable() {
-        let mut app = NetworkManagerApp::mock();
-        for route in Route::ALL {
-            app.select_route_for_test(route);
-            assert_eq!(app.current_route(), route);
+    fn test_app() -> NetworkManagerApp {
+        NetworkManagerApp::new_with_actions(
+            FixtureRepository::default(),
+            RecordingActions::default(),
+        )
+    }
+
+    fn rendered_test_app(
+        cx: &mut TestAppContext,
+        repository: FixtureRepository,
+        actions: RecordingActions,
+    ) -> (Entity<NetworkManagerApp>, &mut VisualTestContext) {
+        cx.update(install_app_hotkeys);
+        cx.add_window_view(move |_, _| NetworkManagerApp::new_with_actions(repository, actions))
+    }
+
+    fn route_of(app: &Entity<NetworkManagerApp>, cx: &VisualTestContext) -> Route {
+        cx.cx.read(|cx| app.read(cx).current_route())
+    }
+
+    fn discovery_filter_of(
+        app: &Entity<NetworkManagerApp>,
+        cx: &VisualTestContext,
+    ) -> DiscoveryFilter {
+        cx.cx.read(|cx| app.read(cx).current_discovery_filter())
+    }
+
+    fn selected_device_of(
+        app: &Entity<NetworkManagerApp>,
+        cx: &VisualTestContext,
+    ) -> Option<String> {
+        cx.cx
+            .read(|cx| app.read(cx).selected_device_id().map(str::to_string))
+    }
+
+    fn action_status_of(
+        app: &Entity<NetworkManagerApp>,
+        cx: &VisualTestContext,
+    ) -> Option<ActionStatus> {
+        cx.cx.read(|cx| app.read(cx).action_status().cloned())
+    }
+
+    #[gpui::test]
+    fn gpui_hotkeys_render_every_route_and_dispatch_refreshes(cx: &mut TestAppContext) {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repository = FixtureRepository {
+            reads: reads.clone(),
+        };
+        let actions = RecordingActions {
+            calls: calls.clone(),
+            fail: false,
+        };
+        let (app, cx) = rendered_test_app(cx, repository, actions);
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["ensure_backend", "refresh:quick"]
+        );
+        calls.lock().unwrap().clear();
+        reads.lock().unwrap().clear();
+
+        for (keystroke, route) in [
+            ("cmd-1", Route::Dashboard),
+            ("cmd-2", Route::Discovery),
+            ("cmd-3", Route::DeviceDetail),
+            ("cmd-4", Route::QuickAccess),
+            ("cmd-5", Route::Settings),
+        ] {
+            cx.simulate_keystrokes(keystroke);
+            assert_eq!(route_of(&app, cx), route, "{keystroke}");
         }
+        let rendered = reads.lock().unwrap().clone();
+        for screen in [
+            "dashboard",
+            "discovery",
+            "detail",
+            "quick_access",
+            "settings",
+        ] {
+            assert!(rendered.contains(&screen), "{screen} did not render");
+        }
+
+        cx.simulate_keystrokes("cmd-]");
+        assert_eq!(route_of(&app, cx), Route::Dashboard);
+        cx.simulate_keystrokes("cmd-[");
+        assert_eq!(route_of(&app, cx), Route::Settings);
+        cx.simulate_keystrokes("cmd-k");
+        assert_eq!(route_of(&app, cx), Route::QuickAccess);
+        cx.simulate_keystrokes("escape");
+        assert_eq!(route_of(&app, cx), Route::Dashboard);
+
+        cx.dispatch_action(ShowDiscovery);
+        assert_eq!(route_of(&app, cx), Route::Discovery);
+
+        cx.simulate_keystrokes("cmd-r");
+        cx.simulate_keystrokes("cmd-shift-r");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["refresh:quick", "refresh:full"]
+        );
+        assert_eq!(
+            action_status_of(&app, cx).map(|status| status.message),
+            Some("refresh ok".into())
+        );
+
+        cx.simulate_keystrokes("cmd-/");
+        assert!(action_status_of(&app, cx)
+            .is_some_and(|status| status.message.contains("⌘1 Dashboard")));
+    }
+
+    #[gpui::test]
+    fn gpui_discovery_detail_and_quick_access_actions_use_real_app_state(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let actions = RecordingActions {
+            calls: calls.clone(),
+            fail: false,
+        };
+        let (app, cx) = rendered_test_app(cx, FixtureRepository::default(), actions);
+        calls.lock().unwrap().clear();
+
+        for filter in DiscoveryFilter::ALL {
+            app.update(cx, |app, cx| app.select_discovery_filter(filter, cx));
+            cx.run_until_parked();
+            assert_eq!(route_of(&app, cx), Route::Discovery);
+            assert_eq!(discovery_filter_of(&app, cx), filter);
+        }
+
+        app.update(cx, |app, cx| {
+            app.set_discovery_identity_state(Some("device-1".into()), TrackedState::Tracked, cx)
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.set_discovery_identity_state(Some("device-1".into()), TrackedState::Untracked, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["track:device-1:tracked", "track:device-1:untracked"]
+        );
+
+        app.update(cx, |app, cx| {
+            app.set_discovery_identity_state(None, TrackedState::Tracked, cx)
+        });
+        assert!(action_status_of(&app, cx).is_some_and(
+            |status| status.is_error() && status.message.contains("no device identity")
+        ));
+
+        app.update(cx, |app, cx| {
+            app.set_route(Route::QuickAccess, cx);
+            app.select_device_detail("device-1".into(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(route_of(&app, cx), Route::DeviceDetail);
+        assert_eq!(selected_device_of(&app, cx).as_deref(), Some("device-1"));
+
+        app.update(cx, |app, cx| app.copy_selected_ssh_command(cx));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("ssh -p 2222 alice@device.local".into())
+        );
+        assert_eq!(
+            action_status_of(&app, cx).map(|status| status.message),
+            Some("Copied ssh -p 2222 alice@device.local".into())
+        );
+
+        app.update(cx, |app, cx| app.copy_selected_target(cx));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("alice@device.local".into())
+        );
+
+        app.update(cx, |app, cx| {
+            app.select_device_detail("no-target".into(), cx)
+        });
+        app.update(cx, |app, cx| app.copy_selected_ssh_command(cx));
+        assert!(action_status_of(&app, cx)
+            .is_some_and(|status| status.is_error() && status.message.contains("No SSH target")));
+    }
+
+    #[gpui::test]
+    fn gpui_settings_lifecycle_and_safe_window_actions_are_wired(cx: &mut TestAppContext) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let actions = RecordingActions {
+            calls: calls.clone(),
+            fail: false,
+        };
+        let (app, cx) = rendered_test_app(cx, FixtureRepository::default(), actions);
+        calls.lock().unwrap().clear();
+
+        cx.dispatch_action(ShowSettings);
+        app.update(cx, |app, cx| app.install_and_start_daemon(cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.start_daemon(cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.restart_daemon(cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.stop_daemon(cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.open_diagnostics_folder(cx));
+        cx.run_until_parked();
+
+        assert_eq!(route_of(&app, cx), Route::Settings);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "daemon:install daemon",
+                "daemon:start daemon",
+                "daemon:restart daemon",
+                "daemon:stop daemon",
+                "open_diagnostics"
+            ]
+        );
+        assert_eq!(
+            action_status_of(&app, cx).map(|status| status.message),
+            Some("diagnostics ok".into())
+        );
+
+        assert!(!cx.update(|window, _| window.is_fullscreen()));
+        cx.dispatch_action(ToggleFullscreen);
+        assert!(cx.update(|window, _| window.is_fullscreen()));
+        cx.dispatch_action(ToggleFullscreen);
+        assert!(!cx.update(|window, _| window.is_fullscreen()));
+
+        cx.deactivate_window();
+        assert!(!cx.update(|window, _| window.is_window_active()));
+        cx.dispatch_action(BringAllToFront);
+        assert!(cx.update(|window, _| window.is_window_active()));
+
+        cx.dispatch_action(CloseWindow);
+        assert!(cx.windows().is_empty());
     }
 
     #[test]
-    fn route_view_model_loads_only_active_repository_model() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let app = NetworkManagerApp::new(CountingRepository {
-            calls: calls.clone(),
-        });
-
-        for (route, expected_call) in [
-            (Route::Dashboard, "dashboard"),
-            (Route::Discovery, "discovery"),
-            (Route::DeviceDetail, "detail"),
-            (Route::QuickAccess, "quick_access"),
-            (Route::Settings, "settings"),
-        ] {
-            calls.lock().unwrap().clear();
-            drop(app.view_model_for_route(route));
-            assert_eq!(calls.lock().unwrap().as_slice(), [expected_call]);
+    fn route_selection_keeps_all_screens_reachable() {
+        let mut app = test_app();
+        for route in Route::ALL {
+            app.select_route_for_test(route);
+            assert_eq!(app.current_route(), route);
         }
     }
 
@@ -866,29 +1030,23 @@ mod tests {
             calls: calls.clone(),
             fail: false,
         };
-        let mut app = NetworkManagerApp::new_with_actions(MockRepository::new(), actions);
+        let mut app = NetworkManagerApp::new_with_actions(FixtureRepository::default(), actions);
 
         app.refresh_for_test(RefreshMode::Full);
-        app.track_discovery_identity_for_test(Some("identity-1".into()));
+        app.set_discovery_identity_state_for_test(Some("identity-1".into()), TrackedState::Tracked);
 
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            ["refresh:full:", "track:identity-1:tracked"]
+            ["refresh:full", "track:identity-1:tracked"]
         );
         assert_eq!(
             app.action_status().map(|status| status.message.as_str()),
             Some("track ok")
         );
-        assert_eq!(
-            app.action_status().map(|status| status.is_error),
-            Some(false)
-        );
+        assert_eq!(app.action_status().map(ActionStatus::is_error), Some(false));
 
-        app.track_discovery_identity_for_test(None);
-        assert_eq!(
-            app.action_status().map(|status| status.is_error),
-            Some(true)
-        );
+        app.set_discovery_identity_state_for_test(None, TrackedState::Tracked);
+        assert_eq!(app.action_status().map(ActionStatus::is_error), Some(true));
     }
 
     #[test]
@@ -898,7 +1056,7 @@ mod tests {
             calls: calls.clone(),
             fail: false,
         };
-        let mut app = NetworkManagerApp::new_with_actions(MockRepository::new(), actions);
+        let mut app = NetworkManagerApp::new_with_actions(FixtureRepository::default(), actions);
 
         app.daemon_lifecycle_for_test(DaemonLifecycleAction::InstallAndStart);
         app.daemon_lifecycle_for_test(DaemonLifecycleAction::Start);
@@ -927,7 +1085,7 @@ mod tests {
             calls: calls.clone(),
             fail: false,
         };
-        let mut app = NetworkManagerApp::new_with_actions(MockRepository::new(), actions);
+        let mut app = NetworkManagerApp::new_with_actions(FixtureRepository::default(), actions);
 
         app.open_diagnostics_folder_for_test();
 
@@ -944,12 +1102,12 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
             fail: true,
         };
-        let mut app = NetworkManagerApp::new_with_actions(MockRepository::new(), actions);
+        let mut app = NetworkManagerApp::new_with_actions(FixtureRepository::default(), actions);
 
         app.refresh_for_test(RefreshMode::Quick);
 
         let status = app.action_status().unwrap();
-        assert!(status.is_error);
+        assert!(status.is_error());
         assert!(status.message.contains("refresh failed"));
     }
 
@@ -965,7 +1123,7 @@ mod tests {
             "Local sync finished. Tailscale is unavailable."
         );
         assert_eq!(status.detail.as_deref(), Some(raw.as_str()));
-        assert!(!status.is_error);
+        assert!(!status.is_error());
     }
 
     #[test]
@@ -986,7 +1144,7 @@ mod tests {
             status.detail.as_deref(),
             Some("Local daemon started. quick refresh: Tailscale unavailable: tailscale status failed")
         );
-        assert!(!status.is_error);
+        assert!(!status.is_error());
     }
 
     #[test]
@@ -1001,7 +1159,7 @@ mod tests {
             "Tailscale is unavailable. LAN discovery may still work."
         );
         assert_eq!(status.detail.as_deref(), Some(raw));
-        assert!(status.is_error);
+        assert!(status.is_error());
     }
 
     #[test]
@@ -1010,20 +1168,15 @@ mod tests {
 
         assert_eq!(status.message, "refresh ok");
         assert_eq!(status.detail, None);
-        assert!(!status.is_error);
+        assert!(!status.is_error());
     }
 
     #[test]
     fn stale_async_action_results_do_not_overwrite_current_status() {
-        let mut app = NetworkManagerApp::mock();
+        let mut app = test_app();
         let stale_action = app.next_action_sequence();
         let current_action = app.next_action_sequence();
-        app.action_status = Some(ActionStatus {
-            message: "current action running".into(),
-            detail: None,
-            is_error: false,
-            is_pending: true,
-        });
+        app.action_status = Some(ActionStatus::pending("current action running"));
 
         app.record_action_result_if_current(
             stale_action,
@@ -1034,7 +1187,7 @@ mod tests {
             Some("current action running")
         );
         assert_eq!(
-            app.action_status().map(|status| status.is_pending),
+            app.action_status().map(ActionStatus::is_pending),
             Some(true)
         );
 
@@ -1047,7 +1200,7 @@ mod tests {
             Some("current action complete")
         );
         assert_eq!(
-            app.action_status().map(|status| status.is_pending),
+            app.action_status().map(ActionStatus::is_pending),
             Some(false)
         );
     }

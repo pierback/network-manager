@@ -1,14 +1,11 @@
-pub mod actions;
-pub mod mock;
-pub mod repository;
-pub mod sqlite;
-pub mod view_models;
+pub(crate) mod actions;
+pub(crate) mod repository;
+pub(crate) mod sqlite;
+pub(crate) mod view_models;
 
-pub use actions::{
-    ActionOutcome, DaemonActions, DaemonLifecycleAction, NetworkManagerActions, NoopActions,
-    RefreshMode,
+pub(crate) use actions::{
+    ActionOutcome, DaemonActions, DaemonLifecycleAction, NetworkManagerActions, RefreshMode,
 };
-pub use mock::MockRepository;
-pub use repository::NetworkManagerRepository;
-pub use sqlite::SqliteRepository;
-pub use view_models::*;
+pub(crate) use repository::NetworkManagerRepository;
+pub(crate) use sqlite::SqliteRepository;
+pub(crate) use view_models::*;

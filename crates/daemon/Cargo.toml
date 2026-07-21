@@ -15,8 +15,11 @@ clap.workspace = true
 network-manager-core = { path = "../core" }
 network-manager-db = { path = "../db" }
 network-manager-ipc = { path = "../ipc" }
-serde = { workspace = true, features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

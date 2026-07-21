@@ -1,12 +1,12 @@
-pub mod app;
-pub mod assets;
-pub mod components;
-pub mod data;
-pub mod hotkeys;
-pub mod layout;
-pub mod routes;
-pub mod screens;
-pub mod theme;
+mod app;
+mod assets;
+mod components;
+mod data;
+mod hotkeys;
+mod layout;
+mod routes;
+mod screens;
+mod theme;
 
 pub use app::NetworkManagerApp;
 pub use assets::NetworkManagerAssets;

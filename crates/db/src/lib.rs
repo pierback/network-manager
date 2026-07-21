@@ -5,12 +5,15 @@ use network_manager_core::{
 };
 use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
+const MAX_LAN_IPS_PER_IDENTITY_HINT: usize = 8;
+const LAN_OBSERVATION_RETENTION_HOURS: i64 = 24;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonStatus {
@@ -61,9 +64,29 @@ pub struct MdnsServiceObservation {
     pub service_type: String,
     pub domain: String,
     pub hostname: Option<String>,
+    #[serde(default)]
     pub ip_addresses: Vec<String>,
     pub port: Option<u16>,
     pub raw_text: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EndpointObservation<'a> {
+    identity_id: &'a str,
+    kind: EndpointKind,
+    address: &'a str,
+    port: Option<u16>,
+    hostname: Option<&'a str>,
+    source: &'a str,
+    reachability: Option<AvailabilityState>,
+}
+
+struct LanIdentityHint {
+    source_device_id: String,
+    display_name: String,
+    mac: Option<String>,
+    hostname: Option<String>,
+    stable_key: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -375,6 +398,11 @@ impl SqliteStore {
             .context("listing network endpoints")
     }
 
+    pub fn endpoints_for_active_identity(&self, identity_id: &str) -> Result<Vec<NetworkEndpoint>> {
+        let identity_id = self.resolve_active_identity_id(identity_id)?;
+        self.endpoints_for_identity(&identity_id)
+    }
+
     pub fn list_endpoints_for_probe(&self, tracked_only: bool) -> Result<Vec<NetworkEndpoint>> {
         let sql = if tracked_only {
             "SELECT e.id, e.identity_id, e.kind, e.address, e.port, e.hostname, e.reachable_state, e.ssh_capability_state, e.last_seen_at, e.last_checked_at
@@ -439,8 +467,10 @@ impl SqliteStore {
              SET reachable_state = 'unknown',
                  ssh_capability_state = 'unknown',
                  updated_at = CURRENT_TIMESTAMP
-             WHERE last_checked_at IS NULL
-                OR last_checked_at < datetime('now', ?1)",
+             WHERE (last_checked_at IS NULL
+                    OR last_checked_at < datetime('now', ?1))
+               AND (reachable_state <> 'unknown'
+                    OR ssh_capability_state <> 'unknown')",
             params![format!("-{older_than_seconds} seconds")],
         )?;
         Ok(changed)
@@ -522,10 +552,10 @@ impl SqliteStore {
                 .clone()
                 .or_else(|| node.dns_name.clone())
                 .unwrap_or_else(|| node.source_device_id.clone());
-            let state = match node.online {
-                Some(true) => "online",
-                Some(false) => "offline",
-                None => "unknown",
+            let reachability = match node.online {
+                Some(true) => AvailabilityState::Online,
+                Some(false) => AvailabilityState::Offline,
+                None => AvailabilityState::Unknown,
             };
 
             self.conn.execute(
@@ -551,27 +581,27 @@ impl SqliteStore {
             )?;
 
             if let Some(hostname) = node.dns_name.as_deref().filter(|name| !name.is_empty()) {
-                self.upsert_endpoint(
-                    &identity_id,
-                    "tailscale_dns",
-                    hostname,
-                    None,
-                    Some(hostname),
-                    "tailscale",
-                    state,
-                )?;
+                self.upsert_endpoint(EndpointObservation {
+                    identity_id: &identity_id,
+                    kind: EndpointKind::TailscaleDns,
+                    address: hostname,
+                    port: None,
+                    hostname: Some(hostname),
+                    source: "tailscale",
+                    reachability: Some(reachability),
+                })?;
             }
 
             for ip in node.tailscale_ips.iter().filter(|ip| !ip.is_empty()) {
-                self.upsert_endpoint(
-                    &identity_id,
-                    "tailscale_ip",
-                    ip,
-                    None,
-                    None,
-                    "tailscale",
-                    state,
-                )?;
+                self.upsert_endpoint(EndpointObservation {
+                    identity_id: &identity_id,
+                    kind: EndpointKind::TailscaleIp,
+                    address: ip,
+                    port: None,
+                    hostname: None,
+                    source: "tailscale",
+                    reachability: Some(reachability),
+                })?;
             }
         }
 
@@ -579,109 +609,214 @@ impl SqliteStore {
     }
 
     pub fn record_lan_devices(&self, observations: &[LanDeviceObservation]) -> Result<usize> {
-        for observation in observations {
-            let source_device_id = observation
-                .mac_address
-                .as_deref()
-                .map(normalize_mac)
-                .filter(|value| !value.is_empty())
-                .or_else(|| observation.hostname.clone())
-                .unwrap_or_else(|| observation.ip_address.clone());
-            let discovered_id = self.discovered_id_for_source("arp", &source_device_id)?;
-            let display_name = observation
-                .hostname
-                .clone()
-                .unwrap_or_else(|| observation.ip_address.clone());
-            let raw_json = serde_json::to_string(observation)?;
-            let fallback_stable_key = if let Some(mac) = observation
-                .mac_address
-                .as_deref()
-                .map(normalize_mac)
-                .filter(|value| !value.is_empty())
-            {
-                Some(format!("mac:{mac}"))
-            } else {
-                observation
-                    .hostname
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .map(|hostname| format!("lan-host:{hostname}"))
-            };
-            let identity_id = self.identity_id_for_discovery(
-                "arp",
-                &source_device_id,
-                fallback_stable_key.as_deref(),
-            )?;
-
-            self.conn.execute(
-                "INSERT INTO discovered_devices(id, source, source_device_id, display_name, raw_json)
-                 VALUES (?1, 'arp', ?2, ?3, ?4)
-                 ON CONFLICT(source, source_device_id) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    raw_json = excluded.raw_json,
-                    last_seen_at = CURRENT_TIMESTAMP",
-                params![discovered_id, source_device_id, display_name, raw_json],
-            )?;
-
-            self.conn.execute(
-                "INSERT INTO discovery_observations(discovered_device_id, identity_id, source, interface_name, evidence_json)
-                 VALUES (?1, ?2, 'arp', ?3, ?4)",
-                params![
-                    discovered_id,
-                    identity_id,
-                    observation.interface_name,
-                    raw_json
-                ],
-            )?;
-
-            if let Some(identity_id) = identity_id {
-                if let Some(mac) = observation
-                    .mac_address
-                    .as_deref()
-                    .map(normalize_mac)
-                    .filter(|value| !value.is_empty())
-                {
-                    self.conn.execute(
-                        "INSERT INTO identity_evidence(identity_id, discovered_device_id, evidence_type, evidence_value, confidence, source)
-                         VALUES (?1, ?2, 'mac_address', ?3, 0.85, 'arp')",
-                        params![identity_id, discovered_id, mac],
-                    )?;
-                }
-
-                if let Some(hostname) = observation
-                    .hostname
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                {
-                    self.conn.execute(
-                        "INSERT INTO identity_evidence(identity_id, discovered_device_id, evidence_type, evidence_value, confidence, source)
-                         VALUES (?1, ?2, 'hostname', ?3, 0.60, 'arp')",
-                        params![identity_id, discovered_id, hostname],
-                    )?;
-                    self.upsert_endpoint(
-                        &identity_id,
-                        "lan_dns",
-                        hostname,
-                        None,
-                        Some(hostname),
-                        "arp",
-                        "unknown",
-                    )?;
-                }
-
-                self.upsert_endpoint(
-                    &identity_id,
-                    "lan_ip",
-                    &observation.ip_address,
-                    None,
-                    None,
-                    "arp",
-                    "unknown",
-                )?;
+        self.conn.execute_batch("SAVEPOINT record_lan_devices")?;
+        match self.record_lan_devices_inner(observations) {
+            Ok(recorded) => {
+                self.conn.execute_batch("RELEASE record_lan_devices")?;
+                Ok(recorded)
+            }
+            Err(error) => {
+                self.conn
+                    .execute_batch("ROLLBACK TO record_lan_devices; RELEASE record_lan_devices")?;
+                Err(error)
             }
         }
+    }
 
-        Ok(observations.len())
+    fn record_lan_devices_inner(&self, observations: &[LanDeviceObservation]) -> Result<usize> {
+        self.conn.execute(
+            "DELETE FROM discovery_observations
+             WHERE source = 'arp'
+               AND observed_at < datetime('now', ?1)",
+            params![format!("-{LAN_OBSERVATION_RETENTION_HOURS} hours")],
+        )?;
+        let mut identity_window = self.recent_lan_observations()?;
+        identity_window.extend_from_slice(observations);
+        let (mut shared_macs, ambiguous_hostnames) = shared_lan_identity_values(&identity_window);
+        shared_macs.extend(self.overloaded_lan_macs()?);
+        self.remove_proxy_arp_data(&shared_macs)?;
+
+        let mut recorded = 0;
+        for observation in observations {
+            recorded += usize::from(self.record_lan_observation(
+                observation,
+                &shared_macs,
+                &ambiguous_hostnames,
+            )?);
+        }
+
+        Ok(recorded)
+    }
+
+    fn record_lan_observation(
+        &self,
+        observation: &LanDeviceObservation,
+        shared_macs: &HashSet<String>,
+        ambiguous_hostnames: &HashSet<String>,
+    ) -> Result<bool> {
+        let Some(hint) = lan_identity_hint(observation, shared_macs, ambiguous_hostnames) else {
+            return Ok(false);
+        };
+        let discovered_id = self.discovered_id_for_source("arp", &hint.source_device_id)?;
+        let raw_json = serde_json::to_string(observation)?;
+        let identity_id = self.identity_id_for_discovery(
+            "arp",
+            &hint.source_device_id,
+            hint.stable_key.as_deref(),
+        )?;
+
+        self.conn.execute(
+            "INSERT INTO discovered_devices(id, source, source_device_id, display_name, raw_json)
+             VALUES (?1, 'arp', ?2, ?3, ?4)
+             ON CONFLICT(source, source_device_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                raw_json = excluded.raw_json,
+                last_seen_at = CURRENT_TIMESTAMP",
+            params![
+                discovered_id,
+                hint.source_device_id,
+                hint.display_name,
+                raw_json
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT INTO discovery_observations(discovered_device_id, identity_id, source, interface_name, evidence_json)
+             VALUES (?1, ?2, 'arp', ?3, ?4)",
+            params![
+                discovered_id,
+                identity_id,
+                observation.interface_name,
+                raw_json
+            ],
+        )?;
+
+        let Some(identity_id) = identity_id else {
+            return Ok(true);
+        };
+        if let Some(mac) = hint.mac.as_deref() {
+            self.conn.execute(
+                "INSERT INTO identity_evidence(identity_id, discovered_device_id, evidence_type, evidence_value, confidence, source)
+                 VALUES (?1, ?2, 'mac_address', ?3, 0.85, 'arp')",
+                params![identity_id, discovered_id, mac],
+            )?;
+        }
+        if let Some(hostname) = hint.hostname.as_deref() {
+            self.conn.execute(
+                "INSERT INTO identity_evidence(identity_id, discovered_device_id, evidence_type, evidence_value, confidence, source)
+                 VALUES (?1, ?2, 'hostname', ?3, 0.60, 'arp')",
+                params![identity_id, discovered_id, hostname],
+            )?;
+            self.upsert_endpoint(EndpointObservation {
+                identity_id: &identity_id,
+                kind: EndpointKind::LanDns,
+                address: hostname,
+                port: None,
+                hostname: Some(hostname),
+                source: "arp",
+                reachability: None,
+            })?;
+        }
+        self.upsert_endpoint(EndpointObservation {
+            identity_id: &identity_id,
+            kind: EndpointKind::LanIp,
+            address: &observation.ip_address,
+            port: None,
+            hostname: None,
+            source: "arp",
+            reachability: None,
+        })?;
+
+        Ok(true)
+    }
+
+    fn recent_lan_observations(&self) -> Result<Vec<LanDeviceObservation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT evidence_json
+             FROM discovery_observations
+             WHERE source = 'arp'
+               AND observed_at >= datetime('now', '-10 minutes')",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut observations = Vec::new();
+        for row in rows {
+            let evidence = row?;
+            if let Ok(observation) = serde_json::from_str(&evidence) {
+                observations.push(observation);
+            }
+        }
+        Ok(observations)
+    }
+
+    fn overloaded_lan_macs(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT substr(i.stable_key, 5)
+             FROM device_identities i
+             JOIN network_endpoints e ON e.identity_id = i.id
+             WHERE i.merged_into_identity_id IS NULL
+               AND i.stable_key LIKE 'mac:%'
+               AND e.kind = 'lan_ip'
+               AND e.source = 'arp'
+             GROUP BY i.id
+             HAVING COUNT(DISTINCT e.address) > ?1",
+        )?;
+        let rows = stmt.query_map(params![MAX_LAN_IPS_PER_IDENTITY_HINT as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    fn remove_proxy_arp_data(&self, shared_macs: &HashSet<String>) -> Result<()> {
+        for mac in shared_macs {
+            let stable_key = format!("mac:{mac}");
+            let identity_id = self
+                .conn
+                .query_row(
+                    "SELECT id FROM device_identities
+                     WHERE stable_key = ?1 AND merged_into_identity_id IS NULL",
+                    params![stable_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(identity_id) = identity_id else {
+                continue;
+            };
+
+            self.conn.execute(
+                "DELETE FROM network_endpoints WHERE identity_id = ?1 AND source = 'arp'",
+                params![identity_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM identity_evidence WHERE identity_id = ?1 AND source = 'arp'",
+                params![identity_id],
+            )?;
+            self.conn.execute(
+                "UPDATE discovery_observations
+                 SET identity_id = NULL
+                 WHERE identity_id = ?1 AND source = 'arp'",
+                params![identity_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM device_identities
+                 WHERE id = ?1
+                   AND NOT EXISTS (SELECT 1 FROM network_endpoints WHERE identity_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM discovery_observations WHERE identity_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM identity_evidence WHERE identity_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM device_user_intent WHERE identity_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM device_tags WHERE identity_id = ?1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM identity_corrections
+                       WHERE from_identity_id = ?1 OR to_identity_id = ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM discovered_devices WHERE identity_override_id = ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM device_identities WHERE merged_into_identity_id = ?1
+                   )",
+                params![identity_id],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn record_mdns_services(&self, observations: &[MdnsServiceObservation]) -> Result<usize> {
@@ -749,19 +884,19 @@ impl SqliteStore {
                      VALUES (?1, ?2, 'hostname', ?3, 0.65, 'mdns')",
                     params![identity_id, discovered_id, hostname.as_str()],
                 )?;
-                self.upsert_endpoint(
-                    &identity_id,
-                    "mdns",
-                    &hostname,
-                    if observation.service_type == "_ssh._tcp" {
+                self.upsert_endpoint(EndpointObservation {
+                    identity_id: &identity_id,
+                    kind: EndpointKind::Mdns,
+                    address: &hostname,
+                    port: if observation.service_type == "_ssh._tcp" {
                         observation.port
                     } else {
                         None
                     },
-                    Some(&hostname),
-                    "mdns",
-                    "online",
-                )?;
+                    hostname: Some(&hostname),
+                    source: "mdns",
+                    reachability: Some(AvailabilityState::Online),
+                })?;
 
                 for ip_address in observation
                     .ip_addresses
@@ -774,19 +909,19 @@ impl SqliteStore {
                          VALUES (?1, ?2, 'ip_address', ?3, 0.65, 'mdns')",
                         params![identity_id, discovered_id, ip_address],
                     )?;
-                    self.upsert_endpoint(
-                        &identity_id,
-                        "lan_ip",
-                        ip_address,
-                        if observation.service_type == "_ssh._tcp" {
+                    self.upsert_endpoint(EndpointObservation {
+                        identity_id: &identity_id,
+                        kind: EndpointKind::LanIp,
+                        address: ip_address,
+                        port: if observation.service_type == "_ssh._tcp" {
                             observation.port
                         } else {
                             None
                         },
-                        None,
-                        "mdns",
-                        "online",
-                    )?;
+                        hostname: None,
+                        source: "mdns",
+                        reachability: None,
+                    })?;
                 }
             }
         }
@@ -803,23 +938,36 @@ impl SqliteStore {
             return Ok(0);
         }
 
+        let Some(identity_id) = self
+            .conn
+            .query_row(
+                "SELECT identity_id FROM network_endpoints WHERE id = ?1",
+                params![endpoint.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(0);
+        };
+        let identity_id = self.resolve_active_identity_id(&identity_id)?;
+
         let mut changed = 0;
         for ip_address in ip_addresses
             .iter()
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
         {
-            self.upsert_endpoint(
-                &endpoint.identity_id,
-                "lan_ip",
-                ip_address,
-                endpoint.port,
-                None,
-                "mdns",
-                "online",
-            )?;
-            changed += 1;
+            changed += self.upsert_endpoint(EndpointObservation {
+                identity_id: &identity_id,
+                kind: EndpointKind::LanIp,
+                address: ip_address,
+                port: endpoint.port,
+                hostname: None,
+                source: "mdns",
+                reachability: None,
+            })?;
         }
+
         Ok(changed)
     }
 
@@ -1562,60 +1710,45 @@ impl SqliteStore {
         Ok(format!("discovered-{}", Uuid::new_v4()))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn upsert_endpoint(
-        &self,
-        identity_id: &str,
-        kind: &str,
-        address: &str,
-        port: Option<u16>,
-        hostname: Option<&str>,
-        source: &str,
-        reachability: &str,
-    ) -> Result<()> {
-        let existing_id = self
-            .conn
-            .query_row(
-                "SELECT id FROM network_endpoints
-                 WHERE identity_id = ?1 AND kind = ?2 AND address = ?3 AND COALESCE(port, 0) = COALESCE(?4, 0)",
-                params![identity_id, kind, address, port.map(i64::from)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+    fn upsert_endpoint(&self, observation: EndpointObservation<'_>) -> Result<usize> {
+        let reachability = observation.reachability.map(AvailabilityState::as_str);
+        let changed = self.conn.execute(
+            "INSERT INTO network_endpoints(
+                id, identity_id, kind, address, port, hostname, source,
+                reachable_state, ssh_capability_state, last_seen_at, last_checked_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, 'unknown'), 'unknown',
+                CASE WHEN ?8 = 'online' OR ?7 = 'arp' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                CASE WHEN ?8 IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END)
+             ON CONFLICT(identity_id, kind, address, COALESCE(port, 0)) DO UPDATE SET
+                hostname = excluded.hostname,
+                source = excluded.source,
+                reachable_state = COALESCE(?8, network_endpoints.reachable_state),
+                last_seen_at = CASE
+                    WHEN ?8 = 'online' OR ?7 = 'arp' THEN CURRENT_TIMESTAMP
+                    ELSE network_endpoints.last_seen_at
+                END,
+                last_checked_at = CASE
+                    WHEN ?8 IS NULL THEN network_endpoints.last_checked_at
+                    ELSE CURRENT_TIMESTAMP
+                END,
+                updated_at = CURRENT_TIMESTAMP
+             WHERE network_endpoints.hostname IS NOT excluded.hostname
+                OR network_endpoints.source <> excluded.source
+                OR ?8 IS NOT NULL
+                OR ?7 = 'arp'",
+            params![
+                format!("endpoint-{}", Uuid::new_v4()),
+                observation.identity_id,
+                observation.kind.as_str(),
+                observation.address,
+                observation.port.map(i64::from),
+                observation.hostname,
+                observation.source,
+                reachability,
+            ],
+        )?;
 
-        if let Some(id) = existing_id {
-            self.conn.execute(
-                "UPDATE network_endpoints SET
-                    hostname = ?2,
-                    source = ?3,
-                    reachable_state = ?4,
-                    last_seen_at = CASE WHEN ?4 = 'online' OR ?3 = 'arp' THEN CURRENT_TIMESTAMP ELSE last_seen_at END,
-                    last_checked_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?1",
-                params![id, hostname, source, reachability],
-            )?;
-        } else {
-            self.conn.execute(
-                "INSERT INTO network_endpoints(
-                    id, identity_id, kind, address, port, hostname, source,
-                    reachable_state, ssh_capability_state, last_seen_at, last_checked_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'unknown',
-                    CASE WHEN ?8 = 'online' OR ?7 = 'arp' THEN CURRENT_TIMESTAMP ELSE NULL END,
-                    CURRENT_TIMESTAMP)",
-                params![
-                    format!("endpoint-{}", Uuid::new_v4()),
-                    identity_id,
-                    kind,
-                    address,
-                    port.map(i64::from),
-                    hostname,
-                    source,
-                    reachability
-                ],
-            )?;
-        }
-        Ok(())
+        Ok(changed)
     }
 
     fn ensure_intent_row(&self, identity_id: &str) -> Result<()> {
@@ -1770,6 +1903,93 @@ fn normalize_mac(value: &str) -> String {
     }
 
     parts.join(":")
+}
+
+fn lan_identity_hint(
+    observation: &LanDeviceObservation,
+    shared_macs: &HashSet<String>,
+    ambiguous_hostnames: &HashSet<String>,
+) -> Option<LanIdentityHint> {
+    let observed_hostname = observation
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let normalized_mac = observation
+        .mac_address
+        .as_deref()
+        .map(normalize_mac)
+        .filter(|value| !value.is_empty());
+    let mac_is_shared = normalized_mac
+        .as_ref()
+        .is_some_and(|mac| shared_macs.contains(mac));
+    let mac = normalized_mac.filter(|_| !mac_is_shared);
+    let normalized_hostname = observed_hostname
+        .map(normalize_hostname)
+        .filter(|hostname| !mac_is_shared || !ambiguous_hostnames.contains(hostname));
+    let source_device_id = mac.clone().or_else(|| normalized_hostname.clone())?;
+    let hostname = normalized_hostname
+        .as_ref()
+        .and_then(|_| observed_hostname.map(str::to_string));
+    let display_name = hostname
+        .clone()
+        .unwrap_or_else(|| observation.ip_address.clone());
+    let stable_key = mac.as_deref().map(|mac| format!("mac:{mac}")).or_else(|| {
+        normalized_hostname
+            .as_deref()
+            .map(|hostname| format!("lan-host:{hostname}"))
+    });
+
+    Some(LanIdentityHint {
+        source_device_id,
+        display_name,
+        mac,
+        hostname,
+        stable_key,
+    })
+}
+
+fn shared_lan_identity_values(
+    observations: &[LanDeviceObservation],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut ips_by_mac = HashMap::<String, HashSet<String>>::new();
+    let mut ips_by_hostname = HashMap::<String, HashSet<String>>::new();
+    for observation in observations {
+        if let Some(mac) = observation
+            .mac_address
+            .as_deref()
+            .map(normalize_mac)
+            .filter(|value| !value.is_empty())
+        {
+            ips_by_mac
+                .entry(mac)
+                .or_default()
+                .insert(observation.ip_address.clone());
+        }
+        if let Some(hostname) = observation
+            .hostname
+            .as_deref()
+            .map(normalize_hostname)
+            .filter(|value| !value.is_empty())
+        {
+            ips_by_hostname
+                .entry(hostname)
+                .or_default()
+                .insert(observation.ip_address.clone());
+        }
+    }
+
+    let values_with_fanout =
+        |values: HashMap<String, HashSet<String>>, limit: usize| -> HashSet<String> {
+            values
+                .into_iter()
+                .filter_map(|(value, ips)| (ips.len() > limit).then_some(value))
+                .collect()
+        };
+    (
+        values_with_fanout(ips_by_mac, MAX_LAN_IPS_PER_IDENTITY_HINT),
+        values_with_fanout(ips_by_hostname, 1),
+    )
 }
 
 fn normalize_hostname(value: &str) -> String {
@@ -2143,6 +2363,10 @@ fn parse_nonnegative_count(column_index: usize, value: i64) -> rusqlite::Result<
 }
 
 pub fn default_db_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("NETWORK_MANAGER_DB").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -2293,6 +2517,194 @@ mod tests {
     }
 
     #[test]
+    fn lan_observation_history_is_indexed_and_bounded() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(tempdir.path().join("test.sqlite")).unwrap();
+        store.migrate().unwrap();
+        store
+            .record_lan_devices(&[LanDeviceObservation {
+                ip_address: "192.168.1.10".into(),
+                hostname: Some("office.local".into()),
+                mac_address: Some("AA:BB:CC:00:11:22".into()),
+                interface_name: Some("en0".into()),
+                raw_text: "fixture".into(),
+            }])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE discovery_observations SET observed_at = datetime('now', '-2 days')",
+                [],
+            )
+            .unwrap();
+
+        store.record_lan_devices(&[]).unwrap();
+
+        let observation_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM discovery_observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let index_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_observations_source_time'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observation_count, 0);
+        assert_eq!(index_count, 1);
+    }
+
+    #[test]
+    fn ignores_proxy_arp_fanout_instead_of_collapsing_many_ips_into_one_identity() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(tempdir.path().join("test.sqlite")).unwrap();
+        store.migrate().unwrap();
+
+        let observations = (0..=(MAX_LAN_IPS_PER_IDENTITY_HINT + 1))
+            .map(|index| LanDeviceObservation {
+                ip_address: format!("192.168.1.{}", index + 10),
+                hostname: Some(if index == 0 {
+                    "known-device.local".to_string()
+                } else {
+                    "proxy-gateway.local".to_string()
+                }),
+                mac_address: Some("AA:BB:CC:00:11:22".to_string()),
+                interface_name: Some("en0".to_string()),
+                raw_text: format!("? (192.168.1.{}) at aa:bb:cc:00:11:22 on en0", index + 10),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(store.record_lan_devices(&observations).unwrap(), 1);
+        assert_eq!(store.list_discovered_devices().unwrap().len(), 1);
+        assert_eq!(store.list_device_identities().unwrap().len(), 1);
+        assert_eq!(
+            store.find_identity_id("mac:aa:bb:cc:00:11:22").unwrap(),
+            IdentityLookup::NotFound
+        );
+
+        let identity_id = match store.find_identity_id("known-device.local").unwrap() {
+            IdentityLookup::Found(identity_id) => identity_id,
+            other => panic!("expected hostname identity, got {other:?}"),
+        };
+        let endpoints = store.endpoints_for_identity(&identity_id).unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "192.168.1.10"));
+    }
+
+    #[test]
+    fn removes_proxy_arp_fanout_accumulated_across_small_batches() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(tempdir.path().join("test.sqlite")).unwrap();
+        store.migrate().unwrap();
+
+        for index in 0..=MAX_LAN_IPS_PER_IDENTITY_HINT {
+            let recorded = store
+                .record_lan_devices(&[LanDeviceObservation {
+                    ip_address: format!("192.168.2.{}", index + 10),
+                    hostname: None,
+                    mac_address: Some("AA:BB:CC:00:22:33".to_string()),
+                    interface_name: Some("en0".to_string()),
+                    raw_text: format!("? (192.168.2.{}) at aa:bb:cc:00:22:33 on en0", index + 10),
+                }])
+                .unwrap();
+            assert_eq!(recorded, usize::from(index < MAX_LAN_IPS_PER_IDENTITY_HINT));
+        }
+
+        assert_eq!(
+            store.find_identity_id("mac:aa:bb:cc:00:22:33").unwrap(),
+            IdentityLookup::NotFound
+        );
+        assert!(store.list_endpoints_for_probe(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleans_legacy_proxy_arp_endpoints_without_deleting_user_intent() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(tempdir.path().join("test.sqlite")).unwrap();
+        store.migrate().unwrap();
+
+        let unclaimed_id = "identity-unclaimed-proxy";
+        let tracked_id = "identity-tracked-proxy";
+        store
+            .conn
+            .execute(
+                "INSERT INTO device_identities(id, stable_key) VALUES (?1, ?2), (?3, ?4)",
+                params![
+                    unclaimed_id,
+                    "mac:aa:bb:cc:00:33:44",
+                    tracked_id,
+                    "mac:aa:bb:cc:00:44:55"
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO device_user_intent(identity_id, tracked_state)
+                 VALUES (?1, 'tracked')",
+                params![tracked_id],
+            )
+            .unwrap();
+        for (identity_id, subnet) in [(unclaimed_id, 3), (tracked_id, 4)] {
+            for index in 0..=MAX_LAN_IPS_PER_IDENTITY_HINT {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO network_endpoints(
+                            id, identity_id, kind, address, source
+                         ) VALUES (?1, ?2, 'lan_ip', ?3, 'arp')",
+                        params![
+                            format!("endpoint-{subnet}-{index}"),
+                            identity_id,
+                            format!("192.168.{subnet}.{}", index + 10)
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(
+            store
+                .record_lan_devices(&[
+                    LanDeviceObservation {
+                        ip_address: "192.168.3.99".to_string(),
+                        hostname: None,
+                        mac_address: Some("AA:BB:CC:00:33:44".to_string()),
+                        interface_name: Some("en0".to_string()),
+                        raw_text: String::new(),
+                    },
+                    LanDeviceObservation {
+                        ip_address: "192.168.4.99".to_string(),
+                        hostname: None,
+                        mac_address: Some("AA:BB:CC:00:44:55".to_string()),
+                        interface_name: Some("en0".to_string()),
+                        raw_text: String::new(),
+                    },
+                ])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.find_identity_id("mac:aa:bb:cc:00:33:44").unwrap(),
+            IdentityLookup::NotFound
+        );
+        assert_eq!(
+            store.find_identity_id("mac:aa:bb:cc:00:44:55").unwrap(),
+            IdentityLookup::Found(tracked_id.to_string())
+        );
+        let tracked = store.device_details_by_id(tracked_id).unwrap().unwrap();
+        assert_eq!(tracked.identity.tracked_state, TrackedState::Tracked);
+        assert!(tracked.endpoints.is_empty());
+    }
+
+    #[test]
     fn records_mdns_services_as_local_ssh_endpoints() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("test.sqlite");
@@ -2360,6 +2772,9 @@ mod tests {
             endpoint.kind == EndpointKind::LanIp
                 && endpoint.address == "192.168.1.10"
                 && endpoint.port == Some(22)
+                && endpoint.reachability == AvailabilityState::Unknown
+                && endpoint.ssh_capability == AvailabilityState::Unknown
+                && endpoint.last_checked_at.is_none()
         }));
     }
 
@@ -2395,11 +2810,50 @@ mod tests {
 
         assert_eq!(changed, 1);
         let endpoints = store.endpoints_for_identity(&identity_id).unwrap();
-        assert!(endpoints.iter().any(|endpoint| {
-            endpoint.kind == EndpointKind::LanIp
-                && endpoint.address == "192.168.1.20"
-                && endpoint.port == Some(22)
-        }));
+        let resolved_endpoint = endpoints
+            .iter()
+            .find(|endpoint| {
+                endpoint.kind == EndpointKind::LanIp
+                    && endpoint.address == "192.168.1.20"
+                    && endpoint.port == Some(22)
+            })
+            .unwrap();
+        assert_eq!(resolved_endpoint.reachability, AvailabilityState::Unknown);
+        assert_eq!(resolved_endpoint.ssh_capability, AvailabilityState::Unknown);
+        assert!(resolved_endpoint.last_checked_at.is_none());
+        assert_eq!(store.mark_stale_endpoint_checks_unknown(0).unwrap(), 0);
+
+        store
+            .set_endpoint_probe_result(
+                &resolved_endpoint.id,
+                Some(AvailabilityState::Online),
+                AvailabilityState::Online,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE network_endpoints SET last_checked_at = '2000-01-02 03:04:05' WHERE id = ?1",
+                params![&resolved_endpoint.id],
+            )
+            .unwrap();
+        let changed = store
+            .record_resolved_endpoint_ips(&mdns_endpoint, &["192.168.1.20".to_string()])
+            .unwrap();
+        assert_eq!(changed, 0);
+
+        let preserved_endpoint = store
+            .endpoints_for_identity(&identity_id)
+            .unwrap()
+            .into_iter()
+            .find(|endpoint| endpoint.id == resolved_endpoint.id)
+            .unwrap();
+        assert_eq!(preserved_endpoint.reachability, AvailabilityState::Online);
+        assert_eq!(preserved_endpoint.ssh_capability, AvailabilityState::Online);
+        assert_eq!(
+            preserved_endpoint.last_checked_at.as_deref(),
+            Some("2000-01-02 03:04:05")
+        );
     }
 
     #[test]
@@ -2515,7 +2969,7 @@ mod tests {
             .set_ssh_port_by_id(&source_id, Some(2222))
             .unwrap();
         source_store
-            .set_endpoint_preference_by_id(&source_id, EndpointPreference::LocalFirst)
+            .set_endpoint_preference_by_id(&source_id, EndpointPreference::LanFirst)
             .unwrap();
 
         let export = source_store.export_user_settings().unwrap();
@@ -2546,7 +3000,7 @@ mod tests {
         assert_eq!(details.identity.ssh_port, Some(2222));
         assert_eq!(
             details.identity.endpoint_preference,
-            EndpointPreference::LocalFirst
+            EndpointPreference::LanFirst
         );
     }
 
@@ -2669,7 +3123,7 @@ mod tests {
             .unwrap();
         store.set_ssh_port_by_id(&source, Some(2200)).unwrap();
         store
-            .set_endpoint_preference_by_id(&source, EndpointPreference::LocalFirst)
+            .set_endpoint_preference_by_id(&source, EndpointPreference::LanFirst)
             .unwrap();
         store.add_tag_by_id(&source, "source-tag").unwrap();
 
@@ -2778,7 +3232,95 @@ mod tests {
         assert!(endpoints
             .iter()
             .any(|endpoint| endpoint.address == "192.168.1.10"));
+        assert_eq!(
+            store.endpoints_for_active_identity(&source).unwrap(),
+            endpoints
+        );
         assert_eq!(store.list_device_identities().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn split_discovered_mdns_device_accepts_legacy_evidence_without_ip_addresses() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("test.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store.migrate().unwrap();
+
+        store
+            .record_mdns_services(&[MdnsServiceObservation {
+                source_device_id: "local.:_ssh._tcp.:Office Mac".to_string(),
+                service_name: "Office Mac".to_string(),
+                service_type: "_ssh._tcp".to_string(),
+                domain: "local".to_string(),
+                hostname: Some("office-mac.local".to_string()),
+                ip_addresses: Vec::new(),
+                port: Some(22),
+                raw_text: "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
+                    .to_string(),
+            }])
+            .unwrap();
+
+        let discovered_record = store.list_discovered_devices().unwrap().remove(0);
+        let discovered_id = discovered_record.device.id;
+        let old_identity_id = discovered_record.identity_id.unwrap();
+        let legacy_evidence = serde_json::json!({
+            "source_device_id": "local.:_ssh._tcp.:Office Mac",
+            "service_name": "Office Mac",
+            "service_type": "_ssh._tcp",
+            "domain": "local",
+            "hostname": "office-mac.local",
+            "port": 22,
+            "raw_text": "Office Mac._ssh._tcp.local. can be reached at office-mac.local.:22"
+        })
+        .to_string();
+
+        assert_eq!(
+            store
+                .conn
+                .execute(
+                    "UPDATE discovered_devices SET raw_json = ?2 WHERE id = ?1",
+                    params![&discovered_id, &legacy_evidence],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .execute(
+                    "UPDATE discovery_observations
+                     SET evidence_json = ?2
+                     WHERE discovered_device_id = ?1",
+                    params![&discovered_id, &legacy_evidence],
+                )
+                .unwrap(),
+            1
+        );
+
+        let result = store
+            .split_discovered_device_by_id(&discovered_id, Some("legacy mDNS split"))
+            .unwrap();
+
+        let new_endpoints = store.endpoints_for_identity(&result.identity_id).unwrap();
+        let old_endpoints = store.endpoints_for_identity(&old_identity_id).unwrap();
+        let discovered_record = store
+            .list_discovered_devices()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.device.id == discovered_id)
+            .unwrap();
+
+        assert_eq!(result.affected_identity_id, old_identity_id);
+        assert_eq!(
+            discovered_record.identity_id,
+            Some(result.identity_id.clone())
+        );
+        assert!(new_endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "office-mac.local"));
+        assert!(!old_endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "office-mac.local"));
     }
 
     #[test]

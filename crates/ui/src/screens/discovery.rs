@@ -8,7 +8,7 @@ use crate::components::{
     status,
 };
 use crate::data::{ActionStatus, DiscoveryRowVm, DiscoveryVm};
-use crate::layout::app_shell::v4_route_shell;
+use crate::layout::app_shell::{route_shell, TitlebarAction};
 use crate::routes::{DiscoveryFilter, Route};
 use crate::theme::LiquidGlassTokens;
 
@@ -20,12 +20,11 @@ pub fn screen(
     cx: &mut Context<NetworkManagerApp>,
 ) -> Div {
     let main = discovery_main(vm, selected_filter, action_status, tokens, cx);
-    v4_route_shell(
+    route_shell(
         Route::Discovery,
         Icon::Radar,
         "Discovery",
-        &[Icon::Refresh, Icon::SlidersHorizontal, Icon::Settings],
-        true,
+        &[TitlebarAction::Refresh, TitlebarAction::ShowSettings],
         main,
         tokens,
         cx,
@@ -51,19 +50,15 @@ fn discovery_main(
         .flex()
         .flex_col()
         .gap(px(18.0))
-        .child(header(vm, tokens, cx))
-        .child(search_filters(selected_filter, tokens, cx))
+        .child(header(tokens, cx))
+        .child(filter_bar(selected_filter, tokens, cx))
         .when_some(action_status, |this, status| {
-            this.child(discovery_status_banner(status, tokens))
+            this.child(status::action_banner(status, tokens))
         })
         .child(discovery_body(vm, selected_filter, tokens, cx))
 }
 
-fn header(
-    _vm: &DiscoveryVm,
-    tokens: LiquidGlassTokens,
-    cx: &mut Context<NetworkManagerApp>,
-) -> Div {
+fn header(tokens: LiquidGlassTokens, cx: &mut Context<NetworkManagerApp>) -> Div {
     div()
         .flex()
         .items_start()
@@ -96,41 +91,20 @@ fn header(
         )
 }
 
-fn search_filters(
+fn filter_bar(
     selected_filter: DiscoveryFilter,
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> Div {
     div()
-        .h(px(52.0))
+        .h(px(40.0))
         .flex()
         .items_center()
-        .gap(px(14.0))
-        .child(search_field(tokens))
+        .gap(px(10.0))
         .children(
             DiscoveryFilter::ALL
                 .into_iter()
                 .map(|filter| filter_chip(filter, filter == selected_filter, tokens, cx)),
-        )
-}
-
-fn search_field(tokens: LiquidGlassTokens) -> Div {
-    div()
-        .w(px(430.0))
-        .h_full()
-        .rounded(px(16.0))
-        .bg(gpui::rgba(0xffffff0d))
-        .px(px(16.0))
-        .flex()
-        .items_center()
-        .gap(px(11.0))
-        .child(icons::icon(Icon::Search, 18.0, tokens.colors.text_muted))
-        .child(
-            div()
-                .font_family("Geist")
-                .text_size(px(14.0))
-                .text_color(tokens.colors.text_muted)
-                .child("Search labels, aliases, endpoints"),
         )
 }
 
@@ -366,61 +340,6 @@ fn track_button(
     }
 }
 
-fn discovery_status_banner(status: &ActionStatus, tokens: LiquidGlassTokens) -> Div {
-    let color = if status.is_error {
-        tokens.colors.offline
-    } else if status.is_pending {
-        tokens.colors.unknown
-    } else {
-        tokens.colors.online
-    };
-    let icon = if status.is_error {
-        Icon::Info
-    } else if status.is_pending {
-        Icon::Refresh
-    } else {
-        Icon::Check
-    };
-    div()
-        .min_h(px(42.0))
-        .rounded(px(14.0))
-        .bg(gpui::rgba(0xffffff0c))
-        .border_1()
-        .border_color(tokens.colors.edge_soft)
-        .px(px(14.0))
-        .flex()
-        .items_center()
-        .gap(px(10.0))
-        .child(icons::icon(icon, 15.0, color))
-        .child(
-            div()
-                .flex_1()
-                .overflow_hidden()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .child(
-                    div()
-                        .font_family("Geist")
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(tokens.colors.text_secondary)
-                        .truncate()
-                        .child(status.message.clone()),
-                )
-                .when(status.detail.is_some(), |this| {
-                    this.child(
-                        div()
-                            .font_family("Geist")
-                            .text_size(px(11.0))
-                            .text_color(tokens.colors.text_muted)
-                            .truncate()
-                            .child("Open Logs for daemon diagnostics."),
-                    )
-                }),
-        )
-}
-
 fn empty_discovery_state(is_empty: bool, tokens: LiquidGlassTokens) -> Div {
     let (title, subtitle) = if is_empty {
         (
@@ -517,4 +436,59 @@ fn source_badge(source: &str, tokens: LiquidGlassTokens) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(tokens.colors.text_secondary)
         .child(source.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use network_manager_core::AvailabilityState;
+
+    fn row(
+        id: &str,
+        sources: &[&str],
+        tracked_state: TrackedState,
+        ssh_capable: bool,
+    ) -> DiscoveryRowVm {
+        DiscoveryRowVm {
+            id: id.into(),
+            identity_id: Some(format!("identity-{id}")),
+            display_name: id.into(),
+            hostname: format!("{id}.local"),
+            ip_address: "192.168.1.20".into(),
+            source: sources.first().copied().unwrap_or("Other").into(),
+            sources: sources.iter().map(|source| (*source).into()).collect(),
+            category: "Fixture".into(),
+            tracked_state,
+            availability: AvailabilityState::Online,
+            ssh_capable,
+            last_seen: "now".into(),
+        }
+    }
+
+    #[test]
+    fn every_discovery_filter_selects_only_matching_rows() {
+        let vm = DiscoveryVm {
+            rows: vec![
+                row("lan", &["LAN"], TrackedState::Tracked, false),
+                row("tailscale", &["Tailscale"], TrackedState::Tracked, false),
+                row("ssh", &["Other"], TrackedState::Tracked, true),
+                row("untracked", &["Other"], TrackedState::Untracked, false),
+            ],
+        };
+        let ids_for = |filter| {
+            filtered_rows(&vm, filter)
+                .into_iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids_for(DiscoveryFilter::AllSources),
+            ["lan", "tailscale", "ssh", "untracked"]
+        );
+        assert_eq!(ids_for(DiscoveryFilter::Lan), ["lan"]);
+        assert_eq!(ids_for(DiscoveryFilter::Tailscale), ["tailscale"]);
+        assert_eq!(ids_for(DiscoveryFilter::SshCapable), ["ssh"]);
+        assert_eq!(ids_for(DiscoveryFilter::Untracked), ["untracked"]);
+    }
 }

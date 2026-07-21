@@ -6,9 +6,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use network_manager_core::TrackedState;
-use network_manager_ipc::pb::{
-    MergeIdentitiesRequest, RefreshRequest, SetTrackedStateRequest, SplitDiscoveredDeviceRequest,
-};
+use network_manager_ipc::pb::{RefreshRequest, SetTrackedStateRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -36,13 +34,6 @@ impl ActionOutcome {
         Self {
             message: message.into(),
             detail: None,
-        }
-    }
-
-    pub fn with_detail(message: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            detail: Some(detail.into()),
         }
     }
 
@@ -89,11 +80,8 @@ impl DaemonLifecycleAction {
 
 pub trait NetworkManagerActions: Send + Sync {
     fn refresh(&self, mode: RefreshMode) -> Result<ActionOutcome>;
-    fn refresh_device(&self, mode: RefreshMode, device_query: &str) -> Result<ActionOutcome>;
     fn ensure_backend(&self) -> Result<ActionOutcome>;
     fn set_tracked_state(&self, device_query: &str, state: TrackedState) -> Result<ActionOutcome>;
-    fn merge_identities(&self, source_query: &str, target_query: &str) -> Result<ActionOutcome>;
-    fn split_discovered_device(&self, discovered_device_id: &str) -> Result<ActionOutcome>;
     fn daemon_lifecycle(&self, action: DaemonLifecycleAction) -> Result<ActionOutcome>;
     fn open_diagnostics_folder(&self) -> Result<ActionOutcome>;
 }
@@ -217,18 +205,13 @@ impl Default for DaemonActions {
 
 impl NetworkManagerActions for DaemonActions {
     fn refresh(&self, mode: RefreshMode) -> Result<ActionOutcome> {
-        self.refresh_device(mode, "")
-    }
-
-    fn refresh_device(&self, mode: RefreshMode, device_query: &str) -> Result<ActionOutcome> {
         let socket = self.socket_path.clone();
-        let device_query = device_query.to_string();
         self.run(async move {
             let mut client = network_manager_ipc::connect_uds(&socket).await?;
             let response = client
                 .refresh(RefreshRequest {
                     mode: mode.as_str().to_string(),
-                    device_query,
+                    device_query: String::new(),
                 })
                 .await?
                 .into_inner();
@@ -285,58 +268,6 @@ impl NetworkManagerActions for DaemonActions {
         })
     }
 
-    fn merge_identities(&self, source_query: &str, target_query: &str) -> Result<ActionOutcome> {
-        let socket = self.socket_path.clone();
-        let source_query = source_query.to_string();
-        let target_query = target_query.to_string();
-        self.run(async move {
-            let mut client = network_manager_ipc::connect_uds(&socket).await?;
-            let response = client
-                .merge_identities(MergeIdentitiesRequest {
-                    source_query,
-                    target_query,
-                    reason: "merged from GPUI device detail".to_string(),
-                })
-                .await?
-                .into_inner();
-            if response.ambiguous {
-                bail!(
-                    "identity query is ambiguous: {}",
-                    response.candidate_identity_ids.join(", ")
-                );
-            }
-            if !response.applied {
-                bail!(response.message);
-            }
-            Ok(ActionOutcome::new(response.message))
-        })
-    }
-
-    fn split_discovered_device(&self, discovered_device_id: &str) -> Result<ActionOutcome> {
-        let socket = self.socket_path.clone();
-        let discovered_device_id = discovered_device_id.to_string();
-        self.run(async move {
-            let mut client = network_manager_ipc::connect_uds(&socket).await?;
-            let response = client
-                .split_discovered_device(SplitDiscoveredDeviceRequest {
-                    discovered_device_id,
-                    reason: "split from GPUI discovery".to_string(),
-                })
-                .await?
-                .into_inner();
-            if response.ambiguous {
-                bail!(
-                    "identity query is ambiguous: {}",
-                    response.candidate_identity_ids.join(", ")
-                );
-            }
-            if !response.applied {
-                bail!(response.message);
-            }
-            Ok(ActionOutcome::new(response.message))
-        })
-    }
-
     fn daemon_lifecycle(&self, action: DaemonLifecycleAction) -> Result<ActionOutcome> {
         let mut args = Vec::new();
         args.push("daemon".to_string());
@@ -380,57 +311,5 @@ impl NetworkManagerActions for DaemonActions {
             "Opened diagnostics folder {}.",
             log_dir.display()
         )))
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct NoopActions;
-
-impl NetworkManagerActions for NoopActions {
-    fn refresh(&self, mode: RefreshMode) -> Result<ActionOutcome> {
-        self.refresh_device(mode, "all devices")
-    }
-
-    fn refresh_device(&self, mode: RefreshMode, device_query: &str) -> Result<ActionOutcome> {
-        Ok(ActionOutcome::new(format!(
-            "{} refresh for {device_query} skipped in mock mode",
-            mode.as_str()
-        )))
-    }
-
-    fn ensure_backend(&self) -> Result<ActionOutcome> {
-        Ok(ActionOutcome::new("mock backend ready"))
-    }
-
-    fn set_tracked_state(&self, device_query: &str, state: TrackedState) -> Result<ActionOutcome> {
-        Ok(ActionOutcome::new(format!(
-            "{device_query} marked {} in mock mode",
-            state.as_str()
-        )))
-    }
-
-    fn merge_identities(&self, source_query: &str, target_query: &str) -> Result<ActionOutcome> {
-        Ok(ActionOutcome::new(format!(
-            "merged {source_query} into {target_query} in mock mode"
-        )))
-    }
-
-    fn split_discovered_device(&self, discovered_device_id: &str) -> Result<ActionOutcome> {
-        Ok(ActionOutcome::new(format!(
-            "split {discovered_device_id} in mock mode"
-        )))
-    }
-
-    fn daemon_lifecycle(&self, action: DaemonLifecycleAction) -> Result<ActionOutcome> {
-        Ok(ActionOutcome::new(format!(
-            "{} skipped in mock mode",
-            action.label()
-        )))
-    }
-
-    fn open_diagnostics_folder(&self) -> Result<ActionOutcome> {
-        Ok(ActionOutcome::new(
-            "opening diagnostics folder skipped in mock mode",
-        ))
     }
 }

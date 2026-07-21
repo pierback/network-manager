@@ -8,6 +8,40 @@ use crate::components::icons::{self, Icon};
 use crate::routes::Route;
 use crate::theme::LiquidGlassTokens;
 
+#[derive(Clone, Copy)]
+pub enum TitlebarAction {
+    ShowDashboard,
+    ShowDiscovery,
+    ShowSettings,
+    Refresh,
+    CopySshCommand,
+    CopyTarget,
+}
+
+impl TitlebarAction {
+    fn icon(self) -> Icon {
+        match self {
+            Self::ShowDashboard => Icon::Dashboard,
+            Self::ShowDiscovery => Icon::Radar,
+            Self::ShowSettings => Icon::Settings,
+            Self::Refresh => Icon::Refresh,
+            Self::CopySshCommand => Icon::Terminal,
+            Self::CopyTarget => Icon::Copy,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::ShowDashboard => "titlebar-dashboard",
+            Self::ShowDiscovery => "titlebar-discovery",
+            Self::ShowSettings => "titlebar-settings",
+            Self::Refresh => "titlebar-refresh",
+            Self::CopySshCommand => "titlebar-terminal",
+            Self::CopyTarget => "titlebar-copy",
+        }
+    }
+}
+
 pub fn window_shell(content: impl IntoElement, tokens: LiquidGlassTokens) -> Div {
     div()
         .size_full()
@@ -15,35 +49,14 @@ pub fn window_shell(content: impl IntoElement, tokens: LiquidGlassTokens) -> Div
         .rounded(px(22.0))
         .bg(tokens.colors.background)
         .text_color(tokens.colors.text)
-        .child(
-            div()
-                .relative()
-                .w(px(1280.0))
-                .h(px(800.0))
-                .child(v4_refraction_layers())
-                .child(content),
-        )
+        .child(div().relative().w(px(1280.0)).h(px(800.0)).child(content))
 }
 
-fn v4_refraction_layers() -> Div {
-    // Keep the V4 liquid-glass material, but remove the oversized translucent
-    // refraction blobs. They read like giant tooltips/hover overlays in the
-    // fixed artboards and make navigation/content look obscured.
-    div().absolute().inset_0()
-}
-
-#[allow(dead_code)]
-pub fn app_body(_sidebar: impl IntoElement, content: impl IntoElement) -> Div {
-    div().size_full().relative().child(content)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn v4_route_shell(
+pub fn route_shell(
     active: Route,
     title_icon: Icon,
     title: &str,
-    action_icons: &[Icon],
-    include_sidebar: bool,
+    actions: &[TitlebarAction],
     content: impl IntoElement,
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
@@ -51,17 +64,15 @@ pub fn v4_route_shell(
     div()
         .size_full()
         .relative()
-        .child(liquid_titlebar(title_icon, title, action_icons, tokens, cx))
-        .when(include_sidebar, |this| {
-            this.child(glass_sidebar(active, tokens, cx))
-        })
+        .child(liquid_titlebar(title_icon, title, actions, tokens, cx))
+        .child(glass_sidebar(active, tokens, cx))
         .child(content)
 }
 
 pub fn liquid_titlebar(
     icon: Icon,
     title: &str,
-    action_icons: &[Icon],
+    actions: &[TitlebarAction],
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> Div {
@@ -105,9 +116,9 @@ pub fn liquid_titlebar(
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .children(action_icons.iter().map(|icon| {
-                    let icon = *icon;
-                    titlebar_action(icon, tokens, cx)
+                .children(actions.iter().map(|action| {
+                    let action = *action;
+                    titlebar_action(action, tokens, cx)
                 })),
         )
 }
@@ -163,7 +174,7 @@ fn window_control(color: u32, id: &'static str, action: WindowControl) -> AnyEle
 }
 
 fn titlebar_action(
-    icon: Icon,
+    action: TitlebarAction,
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> AnyElement {
@@ -175,58 +186,34 @@ fn titlebar_action(
         .flex()
         .items_center()
         .justify_center()
-        .child(icons::icon(icon, 15.0, tokens.colors.text_secondary));
+        .hover(|style| style.bg(tokens.colors.selected))
+        .cursor_pointer()
+        .id(SharedString::from(action.id()))
+        .child(icons::icon(
+            action.icon(),
+            15.0,
+            tokens.colors.text_secondary,
+        ));
 
-    match icon {
-        Icon::Dashboard => base
-            .hover(|style| style.bg(tokens.colors.selected))
-            .cursor_pointer()
-            .id(SharedString::from("titlebar-dashboard"))
+    match action {
+        TitlebarAction::ShowDashboard => base
             .on_click(cx.listener(|app, _, _, cx| app.set_route(Route::Dashboard, cx)))
             .into_any_element(),
-        Icon::Search => base
-            .hover(|style| style.bg(tokens.colors.selected))
-            .cursor_pointer()
-            .id(SharedString::from("titlebar-search"))
+        TitlebarAction::ShowDiscovery => base
             .on_click(cx.listener(|app, _, _, cx| app.set_route(Route::Discovery, cx)))
             .into_any_element(),
-        Icon::Settings => base
-            .hover(|style| style.bg(tokens.colors.selected))
-            .cursor_pointer()
-            .id(SharedString::from("titlebar-settings"))
+        TitlebarAction::ShowSettings => base
             .on_click(cx.listener(|app, _, _, cx| app.set_route(Route::Settings, cx)))
             .into_any_element(),
-        Icon::SlidersHorizontal => base
-            .hover(|style| style.bg(tokens.colors.selected))
-            .cursor_pointer()
-            .id(SharedString::from("titlebar-sliders"))
-            .on_click(cx.listener(|app, _, _, cx| app.set_route(Route::Settings, cx)))
-            .into_any_element(),
-        Icon::Refresh | Icon::RotateCcw => base
-            .hover(|style| style.bg(tokens.colors.selected))
-            .cursor_pointer()
-            .id(SharedString::from("titlebar-refresh"))
+        TitlebarAction::Refresh => base
             .on_click(cx.listener(|app, _, _, cx| app.refresh_quick(cx)))
             .into_any_element(),
-        Icon::Bell => base
-            .hover(|style| style.bg(tokens.colors.selected))
-            .cursor_pointer()
-            .id(SharedString::from("titlebar-shortcuts"))
-            .on_click(cx.listener(|app, _, _, cx| app.show_keyboard_shortcuts(cx)))
-            .into_any_element(),
-        Icon::Terminal => base
-            .hover(|style| style.bg(tokens.colors.selected))
-            .cursor_pointer()
-            .id(SharedString::from("titlebar-terminal"))
+        TitlebarAction::CopySshCommand => base
             .on_click(cx.listener(|app, _, _, cx| app.copy_selected_ssh_command(cx)))
             .into_any_element(),
-        Icon::Copy => base
-            .hover(|style| style.bg(tokens.colors.selected))
-            .cursor_pointer()
-            .id(SharedString::from("titlebar-copy"))
+        TitlebarAction::CopyTarget => base
             .on_click(cx.listener(|app, _, _, cx| app.copy_selected_target(cx)))
             .into_any_element(),
-        _ => base.into_any_element(),
     }
 }
 
@@ -255,23 +242,14 @@ pub fn glass_sidebar(
             Route::Dashboard,
             active,
             Icon::Dashboard,
-            None,
             tokens,
             cx,
         ))
-        .child(nav_item(
-            Route::Discovery,
-            active,
-            Icon::Radar,
-            None,
-            tokens,
-            cx,
-        ))
+        .child(nav_item(Route::Discovery, active, Icon::Radar, tokens, cx))
         .child(nav_item(
             Route::DeviceDetail,
             active,
             Icon::PanelRight,
-            None,
             tokens,
             cx,
         ))
@@ -279,12 +257,10 @@ pub fn glass_sidebar(
             Route::Settings,
             active,
             Icon::Settings,
-            None,
             tokens,
             cx,
         ))
         .child(div().flex_1())
-        .child(tailscale_footer(tokens))
 }
 
 fn workspace_header(tokens: LiquidGlassTokens) -> Div {
@@ -335,7 +311,6 @@ fn nav_item(
     route: Route,
     active: Route,
     icon: Icon,
-    count: Option<&'static str>,
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> impl IntoElement {
@@ -381,76 +356,5 @@ fn nav_item(
                 })
                 .child(route.label().to_string()),
         )
-        .when_some(count, |this, count| {
-            this.child(
-                div()
-                    .font_family("Geist Mono")
-                    .text_size(px(10.0))
-                    .text_color(tokens.colors.text_muted)
-                    .child(count),
-            )
-        })
         .on_click(cx.listener(move |app, _, _, cx| app.set_route(route, cx)))
-}
-
-fn tailscale_footer(tokens: LiquidGlassTokens) -> Div {
-    div()
-        .rounded(px(18.0))
-        .bg(gpui::rgba(0xffffff0d))
-        .border_1()
-        .border_color(tokens.colors.edge_soft)
-        .p(px(14.0))
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .child(
-            div()
-                .font_family("Geist Mono")
-                .text_size(px(10.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(tokens.colors.text_muted)
-                .child("LOCAL TAILSCALE"),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .child(
-                    div()
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .rounded_full()
-                        .bg(tokens.colors.online),
-                )
-                .child(
-                    div()
-                        .font_family("Geist")
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(tokens.colors.text_secondary)
-                        .child("Local only"),
-                ),
-        )
-        .child(
-            div()
-                .font_family("Geist")
-                .text_size(px(11.0))
-                .text_color(tokens.colors.text_muted)
-                .child("Used for presence and fallback SSH routes."),
-        )
-}
-
-#[allow(dead_code)]
-pub fn sidebar(
-    active: Route,
-    tokens: LiquidGlassTokens,
-    cx: &mut Context<NetworkManagerApp>,
-) -> Div {
-    glass_sidebar(active, tokens, cx)
-}
-
-#[allow(dead_code)]
-pub fn content_frame(content: impl IntoElement) -> impl IntoElement {
-    div().size_full().child(content)
 }

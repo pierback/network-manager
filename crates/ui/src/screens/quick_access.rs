@@ -22,117 +22,47 @@ pub fn screen(
 ) -> Div {
     div()
         .size_full()
-        .relative()
         .flex()
         .items_center()
         .justify_center()
-        .child(popover_artboard(vm, action_status, tokens, cx))
+        .child(panel(vm, action_status, tokens, cx))
 }
 
-fn popover_artboard(
-    vm: &QuickAccessVm,
-    action_status: Option<&ActionStatus>,
-    tokens: LiquidGlassTokens,
-    cx: &mut Context<NetworkManagerApp>,
-) -> Div {
-    div()
-        .relative()
-        .w(px(440.0))
-        .h(px(620.0))
-        .rounded(px(24.0))
-        .bg(tokens.colors.background)
-        .overflow_hidden()
-        .child(menu_bar(tokens))
-        .child(popover_pointer(tokens))
-        .child(popover_shell(vm, action_status, tokens, cx))
-}
-
-fn menu_bar(tokens: LiquidGlassTokens) -> Div {
-    div()
-        .absolute()
-        .top(px(0.0))
-        .left(px(0.0))
-        .w(px(440.0))
-        .h(px(34.0))
-        .bg(gpui::rgba(0x0b0c0dff))
-        .px(px(18.0))
-        .flex()
-        .items_center()
-        .child(
-            div()
-                .rounded(px(9.0))
-                .bg(gpui::rgba(0xffffff14))
-                .px(px(9.0))
-                .py(px(5.0))
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .child(icons::icon(Icon::Network, 13.0, tokens.colors.text))
-                .child(
-                    div()
-                        .font_family("Geist")
-                        .text_size(px(11.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(tokens.colors.text)
-                        .child("Network"),
-                ),
-        )
-}
-
-fn popover_pointer(tokens: LiquidGlassTokens) -> Div {
-    div()
-        .absolute()
-        .left(px(194.0))
-        .top(px(38.0))
-        .w(px(52.0))
-        .h(px(18.0))
-        .rounded(px(12.0))
-        .bg(tokens.colors.popover)
-        .border_1()
-        .border_color(tokens.colors.edge)
-        .child(
-            div()
-                .absolute()
-                .left(px(10.0))
-                .top(px(3.0))
-                .w(px(32.0))
-                .h(px(1.0))
-                .bg(gpui::rgba(0xffffff35)),
-        )
-}
-
-fn popover_shell(
+fn panel(
     vm: &QuickAccessVm,
     action_status: Option<&ActionStatus>,
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> impl IntoElement {
     div()
-        .absolute()
-        .left(px(30.0))
-        .top(px(48.0))
         .w(px(380.0))
         .h(px(540.0))
         .rounded(px(24.0))
         .bg(tokens.colors.popover)
         .border_1()
         .border_color(tokens.colors.edge)
-        .id(SharedString::from("quick-access-popover-scroll"))
+        .id(SharedString::from("quick-access-scroll"))
         .overflow_y_scroll()
         .flex()
         .flex_col()
-        .child(popover_header(action_status, tokens, cx))
+        .child(header(action_status, tokens, cx))
+        .children(action_status.map(|status| {
+            div()
+                .px(px(16.0))
+                .pt(px(12.0))
+                .child(status::action_banner(status, tokens))
+        }))
         .child(summary(vm, tokens))
         .child(device_list(vm, tokens, cx))
         .child(footer(vm, tokens, cx))
 }
 
-fn popover_header(
+fn header(
     action_status: Option<&ActionStatus>,
     tokens: LiquidGlassTokens,
     cx: &mut Context<NetworkManagerApp>,
 ) -> Div {
-    let refresh_accent = action_status.is_some_and(|status| status.is_pending);
+    let refresh_accent = action_status.is_some_and(ActionStatus::is_pending);
     div()
         .h(px(60.0))
         .px(px(16.0))

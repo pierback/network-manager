@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +16,17 @@ impl AvailabilityState {
             Self::Offline => "offline",
             Self::Unknown => "unknown",
         }
+    }
+
+    pub fn aggregate(states: impl IntoIterator<Item = Self>) -> Self {
+        states
+            .into_iter()
+            .max_by_key(|state| match state {
+                Self::Online => 2,
+                Self::Offline => 1,
+                Self::Unknown => 0,
+            })
+            .unwrap_or(Self::Unknown)
     }
 }
 
@@ -109,8 +119,8 @@ impl std::str::FromStr for EndpointKind {
 pub enum EndpointPreference {
     #[default]
     Auto,
-    LocalFirst,
     TailscaleFirst,
+    #[serde(alias = "local_first")]
     LanFirst,
 }
 
@@ -118,7 +128,6 @@ impl EndpointPreference {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::LocalFirst => "local_first",
             Self::TailscaleFirst => "tailscale_first",
             Self::LanFirst => "lan_first",
         }
@@ -137,8 +146,7 @@ impl std::str::FromStr for EndpointPreference {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "auto" => Ok(Self::Auto),
-            "local_first" => Ok(Self::LocalFirst),
-            "lan_first" => Ok(Self::LanFirst),
+            "local_first" | "lan_first" => Ok(Self::LanFirst),
             "tailscale_first" => Ok(Self::TailscaleFirst),
             other => Err(ParseDomainEnumError::new("EndpointPreference", other)),
         }
@@ -263,6 +271,30 @@ impl SshTarget {
         args.push(self.destination());
         args
     }
+
+    pub fn shell_command(&self) -> String {
+        format_shell_command("ssh", &self.command_args())
+    }
+}
+
+pub fn format_shell_command(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(shell_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -302,7 +334,7 @@ pub fn resolve_ssh_target(
             if candidates.iter().any(|endpoint| {
                 endpoint.kind.is_lan() && endpoint.reachability == AvailabilityState::Online
             }) {
-                EndpointPreference::LocalFirst
+                EndpointPreference::LanFirst
             } else {
                 EndpointPreference::TailscaleFirst
             }
@@ -323,14 +355,22 @@ pub fn resolve_ssh_target(
     })
 }
 
-fn ssh_score(
-    endpoint: &NetworkEndpoint,
-    preference: EndpointPreference,
-) -> (u8, u8, u8, Reverse<u8>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SshScore {
+    proven: u8,
+    transport: u8,
+    reachability: u8,
+    ssh_capability: u8,
+    endpoint_kind: u8,
+}
+
+fn ssh_score(endpoint: &NetworkEndpoint, preference: EndpointPreference) -> SshScore {
+    let proven_rank = u8::from(
+        endpoint.reachability != AvailabilityState::Online
+            || endpoint.ssh_capability != AvailabilityState::Online,
+    );
     let group_rank = match preference {
-        EndpointPreference::Auto
-        | EndpointPreference::LocalFirst
-        | EndpointPreference::LanFirst => {
+        EndpointPreference::Auto | EndpointPreference::LanFirst => {
             if endpoint.kind.is_lan() {
                 0
             } else if endpoint.kind.is_tailscale() {
@@ -362,14 +402,13 @@ fn ssh_score(
         AvailabilityState::Offline => 9,
     };
 
-    // Prefer names over raw IPs within each transport group. Reverse keeps this tuple stable when
-    // adding future refinements without making IP addresses identity evidence.
-    (
-        group_rank,
-        reachability_rank,
-        ssh_rank,
-        Reverse(9 - endpoint.kind.rank_within_group()),
-    )
+    SshScore {
+        proven: proven_rank,
+        transport: group_rank,
+        reachability: reachability_rank,
+        ssh_capability: ssh_rank,
+        endpoint_kind: endpoint.kind.rank_within_group(),
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +440,26 @@ mod tests {
             last_seen_at: None,
             last_checked_at: None,
         }
+    }
+
+    #[test]
+    fn availability_aggregation_prefers_online_then_offline() {
+        assert_eq!(
+            AvailabilityState::aggregate([
+                AvailabilityState::Unknown,
+                AvailabilityState::Offline,
+                AvailabilityState::Online,
+            ]),
+            AvailabilityState::Online
+        );
+        assert_eq!(
+            AvailabilityState::aggregate([AvailabilityState::Unknown, AvailabilityState::Offline,]),
+            AvailabilityState::Offline
+        );
+        assert_eq!(
+            AvailabilityState::aggregate([AvailabilityState::Unknown]),
+            AvailabilityState::Unknown
+        );
     }
 
     #[test]
@@ -489,13 +548,63 @@ mod tests {
     }
 
     #[test]
+    fn shell_command_quotes_untrusted_arguments() {
+        let target = SshTarget {
+            endpoint_id: "endpoint-1".into(),
+            host: "host name.local".into(),
+            port: 2222,
+            username: Some("user'; touch /tmp/nope; echo '".into()),
+            endpoint_kind: EndpointKind::LanDns,
+        };
+
+        assert_eq!(
+            target.shell_command(),
+            "ssh -p 2222 'user'\"'\"'; touch /tmp/nope; echo '\"'\"'@host name.local'"
+        );
+    }
+
+    #[test]
+    fn proven_endpoint_wins_before_transport_preference() {
+        let mut unproven_lan = endpoint(
+            "lan",
+            EndpointKind::LanIp,
+            "192.168.1.25",
+            AvailabilityState::Unknown,
+        );
+        unproven_lan.ssh_capability = AvailabilityState::Unknown;
+        let tailscale = endpoint(
+            "ts",
+            EndpointKind::TailscaleDns,
+            "mac.tailnet.ts.net",
+            AvailabilityState::Online,
+        );
+
+        let target = resolve_ssh_target(
+            &[unproven_lan.clone(), tailscale],
+            EndpointPreference::LanFirst,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(target.endpoint_id, "ts");
+        let fallback =
+            resolve_ssh_target(&[unproven_lan], EndpointPreference::LanFirst, None, None).unwrap();
+        assert_eq!(fallback.endpoint_id, "lan");
+    }
+
+    #[test]
     fn availability_state_rejects_obsolete_status_aliases() {
         assert!("stale".parse::<AvailabilityState>().is_err());
         assert!("degraded".parse::<AvailabilityState>().is_err());
     }
 
     #[test]
-    fn endpoint_preference_rejects_obsolete_local_first_alias() {
+    fn endpoint_preference_accepts_legacy_local_first_value() {
+        assert_eq!(
+            "local_first".parse::<EndpointPreference>().unwrap(),
+            EndpointPreference::LanFirst
+        );
         assert!("lan_then_tailscale".parse::<EndpointPreference>().is_err());
     }
 }
