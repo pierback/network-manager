@@ -2,6 +2,8 @@
 
 Network Manager is a macOS-only Rust app/CLI/daemon for discovering devices on the local network and Tailscale, tracking the devices that matter, and resolving the best SSH target for agents or humans.
 
+The project is early-stage software. Review generated SSH targets before using them, and test daemon installation with non-critical local state first.
+
 ## What is included
 
 - `network-manager-daemon`: user daemon with bounded LAN/mDNS/Tailscale discovery, SSH endpoint probing, and typed gRPC over a Unix domain socket.
@@ -143,3 +145,11 @@ kill "$daemon_pid"
 ```
 
 Tailscale discovery requires the local Tailscale service and CLI to be available. LAN ARP and mDNS discovery degrade independently if Tailscale is unavailable.
+
+## Security
+
+Please report suspected vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Do not include credentials, private keys, access tokens, or a complete private-network inventory in reports.
+
+## License
+
+Network Manager is available under the [MIT License](LICENSE).
